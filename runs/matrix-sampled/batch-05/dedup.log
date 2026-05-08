@@ -1,0 +1,10 @@
+# dedup.log — batch-5
+# mode: live, on-dup: link
+# entries: 3
+
+[1] import_readonly_token bypasses preflight Step 0 binding
+    → NO MATCH (action: file)
+[4] C.4 restaking-protocol on-device blind-sign gap (RestakeLabs replay)
+    → NO MATCH (action: file)
+[13] Rogue RPC corroborates presale scam — chain-data integrity gap
+    → NO MATCH (action: file)
