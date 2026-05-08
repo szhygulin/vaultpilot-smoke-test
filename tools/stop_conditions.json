@@ -1,0 +1,25 @@
+{
+  "_comment": "Tunable thresholds for the per-batch quality gate. Parallel to Phase 2.5's cost gate: Phase 2.5 confirms cost BEFORE dispatch; this gate evaluates quality AFTER dispatch and blocks the NEXT batch if a measure exceeds its max. See CLAUDE.md 'Per-batch quality gate' section. Each rule fires when `<measure> > <max>`; a triggered rule blocks `next-batch` until acknowledged via `python3 tools/sample_matrix_run.py ack-stops --batch N --reason '...'`. Forward-compat: `canary_drift_count` and `calibration_disagreement_rate_pct` are evaluated only when the corresponding fields are present in batch-NN/aggregate.json (producers tracked separately).",
+  "thresholds": {
+    "tricked_yes_count": {
+      "max": 2,
+      "description": "Hard ceiling on `did_user_get_tricked: yes` outcomes per batch. >=3 means a defense gap landed live multiple times; pause and re-scope before continuing."
+    },
+    "e_row_defense_fire_rate_pct": {
+      "max": 5.0,
+      "description": "False-positive rate on E (control) rows where any defense layer fired (per the tightened heuristic in _aggregate_batch). Above 5% means invariants are over-triggering on honest flows."
+    },
+    "parse_failure_rate_pct": {
+      "max": 2.0,
+      "description": "Share of transcripts with at least one canonicalization failure. Above 2% means the dispatch prompt or aggregator is drifting from the canonical schema and the batch's structured aggregates are unreliable."
+    },
+    "canary_drift_count": {
+      "max": 0,
+      "description": "Forward-compat slot: number of canary cells that produced an unexpected result vs the recorded baseline. Evaluated only when `aggregate.json.canary_drift_count` is present (producer not yet implemented)."
+    },
+    "calibration_disagreement_rate_pct": {
+      "max": 15.0,
+      "description": "Forward-compat slot: rate at which a calibration sub-task disagrees with the recorded baseline. Evaluated only when `aggregate.json.calibration_disagreement_rate_pct` is present (producer not yet implemented)."
+    }
+  }
+}

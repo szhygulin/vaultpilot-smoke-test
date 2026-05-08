@@ -31,9 +31,16 @@ Subcommands:
   init                   Create partition.json + progress.json (one-time).
   next-batch             Print the next pending batch's cells and write its
                          scripts.json under runs/matrix-sampled/batch-NN/.
-                         Marks the batch as in_progress.
+                         Marks the batch as in_progress. Refuses to advance
+                         if the previous batch triggered any stop condition
+                         that hasn't been acknowledged via `ack-stops`.
   mark-completed --batch N [--transcripts PATH]
-                         Mark batch N as completed.
+                         Mark batch N as completed. Auto-aggregates and
+                         evaluates stop conditions (writes
+                         batch-NN/stop_conditions.json).
+  ack-stops --batch N --reason "..."
+                         Acknowledge the triggered stop conditions on a
+                         completed batch so `next-batch` can proceed.
   status                 Show overall progress (X / total batches done).
 
 Outputs (under runs/matrix-sampled/):
@@ -56,6 +63,7 @@ MATRIX_PATH = f'{REPO}/test-vectors/matrix.json'
 SAMPLE_DIR = f'{REPO}/runs/matrix-sampled'
 PARTITION_PATH = f'{SAMPLE_DIR}/partition.json'
 PROGRESS_PATH = f'{SAMPLE_DIR}/progress.json'
+STOP_CONDITIONS_PATH = f'{REPO}/tools/stop_conditions.json'
 
 # Make sibling modules in tools/ importable when this file runs as a script.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -217,6 +225,29 @@ def cmd_next_batch(args: argparse.Namespace) -> None:
     partition = json.load(open(PARTITION_PATH))
 
     pending = [b for b in progress['batches'] if b['status'] == 'pending']
+
+    # Per-batch quality gate (stop-the-line). Only enforced when there's
+    # actually a pending batch to advance to — when the run is finished, the
+    # "All batches completed" message takes precedence over the gate.
+    if pending:
+        blocked, triggered = _check_previous_batch_stops(progress)
+        if blocked:
+            prev = triggered[0]['_batch']
+            sys.stderr.write(
+                f"\nERROR: batch {prev} triggered {len(triggered)} stop "
+                f"condition(s); refusing to start the next batch.\n\n")
+            for t in triggered:
+                sys.stderr.write(
+                    f"  - {t['name']}: measure={t['measure']} > max={t['max']}\n"
+                    f"      {t.get('description', '')}\n")
+            sys.stderr.write(
+                f"\nReview: cat runs/matrix-sampled/batch-{prev:02d}/stop_conditions.json\n"
+                f"\nTo acknowledge and proceed:\n"
+                f"  python3 tools/sample_matrix_run.py ack-stops --batch {prev} "
+                f"--reason '<one-line explanation>'\n\n"
+                f"Tune thresholds (without code changes) in tools/stop_conditions.json.\n")
+            sys.exit(1)
+
     if not pending:
         in_prog = [b for b in progress['batches'] if b['status'] == 'in_progress']
         if in_prog:
@@ -702,6 +733,14 @@ def _aggregate_batch(batch_n: int, transcripts_dir: str | None = None,
     with open(aggregate_path, 'w') as f:
         json.dump(aggregate, f, indent=2)
 
+    # Per-batch quality gate (stop-the-line). Evaluated as part of the
+    # aggregate step so it's always in sync with aggregate.json. Writes
+    # batch-NN/stop_conditions.json. `next-batch` checks the previous batch's
+    # report and refuses to advance if `triggered` is non-empty and the
+    # per-batch ack stamp is absent.
+    stop_report = _evaluate_stop_conditions(batch_n, aggregate)
+    aggregate['stop_conditions_triggered'] = [t['name'] for t in stop_report['triggered']]
+
     if not quiet:
         print(f"  wrote {summary_path}")
         print(f"  wrote {aggregate_path}")
@@ -736,7 +775,200 @@ def _aggregate_batch(batch_n: int, transcripts_dir: str | None = None,
                       f"{pf['raw'][:80]}{note}")
             if len(all_parse_failures) > 5:
                 print(f"     ... and {len(all_parse_failures) - 5} more in aggregate.json")
+        # Stop-conditions report (always emit a one-liner so the orchestrator
+        # and humans-reviewing-logs can see the quality-gate state at a glance).
+        stop_path = f'{batch_dir}/stop_conditions.json'
+        triggered = stop_report['triggered']
+        if triggered:
+            print(f"  ⚠ {len(triggered)} stop condition(s) triggered — "
+                  f"`next-batch` will block until acknowledged. See {stop_path}.")
+            for t in triggered:
+                print(f"     - {t['name']}: measure={t['measure']} > max={t['max']} "
+                      f"({t['description']})")
+            print(f"  override: python3 tools/sample_matrix_run.py ack-stops "
+                  f"--batch {batch_n} --reason '<why it's safe to continue>'")
+        else:
+            print(f"  stop conditions: all clear ({stop_report['evaluated_count']} "
+                  f"rules evaluated, 0 triggered).")
     return aggregate
+
+
+# ---------------------------------------------------------------------------
+# Per-batch quality gate (stop-the-line)
+# ---------------------------------------------------------------------------
+# Parallel structure to Phase 2.5's cost gate:
+#   - Phase 2.5 (preflight_gate.sh + cost preflight block) confirms cost
+#     BEFORE dispatch and is human-confirmed.
+#   - This gate evaluates quality measures AFTER dispatch from
+#     batch-NN/aggregate.json and is computed.
+# Different SOTs, different timing — they don't overlap.
+#
+# Evaluation flow:
+#   mark-completed → _aggregate_batch → _evaluate_stop_conditions
+#                                      → batch-NN/stop_conditions.json
+#   next-batch    → _check_previous_batch_stops(prior_batch_n)
+#                  → exit 1 unless batch-NN/.stops-acknowledged exists
+#   ack-stops     → cmd_ack_stops writes .stops-acknowledged with reason
+#
+# Forward-compat: thresholds for measures the aggregator doesn't yet produce
+# (canary_drift_count, calibration_disagreement_rate_pct) are skipped silently
+# until the corresponding fields appear in aggregate.json. Producers can land
+# in later issues without changing this evaluator.
+
+def _load_stop_conditions(path: str | None = None) -> dict:
+    """Load thresholds from tools/stop_conditions.json. Returns the
+    `thresholds` mapping. Missing file → returns {} (gate becomes a no-op),
+    surfaces a warning so it's obvious the gate isn't active.
+
+    `path=None` (default) resolves to the module-level STOP_CONDITIONS_PATH
+    at call time — tests that override the path via `smr.STOP_CONDITIONS_PATH = ...`
+    work because we don't bind the default at definition time."""
+    if path is None:
+        path = STOP_CONDITIONS_PATH
+    if not os.path.exists(path):
+        sys.stderr.write(
+            f"WARN: stop-conditions config missing at {path}; "
+            f"per-batch quality gate is OFF.\n")
+        return {}
+    cfg = json.load(open(path))
+    return cfg.get('thresholds', {})
+
+
+def _compute_stop_measures(aggregate: dict) -> dict:
+    """Compute the runtime measures the gate compares against thresholds.
+    Each measure is `(value, source-description)` — value is None when the
+    underlying field is absent (forward-compat slots)."""
+    total = aggregate.get('total_transcripts', 0) or 0
+    by_role = aggregate.get('by_role', {}) or {}
+    parse_failures = aggregate.get('parse_failures', []) or []
+    e_total = by_role.get('E', 0) or 0
+    e_fp = aggregate.get('e_false_positive_count', 0) or 0
+    tricked = aggregate.get('tricked_count', 0) or 0
+
+    measures: dict = {
+        'tricked_yes_count': tricked,
+        'parse_failure_rate_pct': (
+            (len({pf['file'] for pf in parse_failures}) / total * 100.0)
+            if total else 0.0
+        ),
+        'e_row_defense_fire_rate_pct': (
+            (e_fp / e_total * 100.0) if e_total else 0.0
+        ),
+    }
+    # Forward-compat slots: only populate if the producer landed.
+    if 'canary_drift_count' in aggregate:
+        measures['canary_drift_count'] = aggregate['canary_drift_count']
+    if 'calibration_disagreement_rate_pct' in aggregate:
+        measures['calibration_disagreement_rate_pct'] = (
+            aggregate['calibration_disagreement_rate_pct'])
+    return measures
+
+
+def _evaluate_stop_conditions(batch_n: int, aggregate: dict) -> dict:
+    """Compare measures to thresholds, write batch-NN/stop_conditions.json,
+    return the report dict. A rule fires when `measure > max`."""
+    thresholds = _load_stop_conditions()
+    measures = _compute_stop_measures(aggregate)
+    triggered = []
+    evaluated = 0
+    for name, spec in thresholds.items():
+        if not isinstance(spec, dict) or 'max' not in spec:
+            continue
+        if name not in measures:
+            # Forward-compat: producer hasn't landed; skip silently.
+            continue
+        evaluated += 1
+        value = measures[name]
+        if value is None:
+            continue
+        if value > spec['max']:
+            triggered.append({
+                'name': name,
+                'measure': value,
+                'max': spec['max'],
+                'description': spec.get('description', ''),
+            })
+    report = {
+        'batch': batch_n,
+        'evaluated_at': _now(),
+        'thresholds_path': os.path.relpath(STOP_CONDITIONS_PATH, REPO),
+        'measures': measures,
+        'evaluated_count': evaluated,
+        'triggered': triggered,
+    }
+    batch_dir = f'{SAMPLE_DIR}/batch-{batch_n:02d}'
+    os.makedirs(batch_dir, exist_ok=True)
+    out_path = f'{batch_dir}/stop_conditions.json'
+    with open(out_path, 'w') as f:
+        json.dump(report, f, indent=2)
+    return report
+
+
+def _previous_completed_batch(progress: dict) -> int | None:
+    """Return the highest-numbered completed batch, or None if none done."""
+    done = [b['batch'] for b in progress['batches']
+            if b['status'] == 'completed']
+    return max(done) if done else None
+
+
+def _check_previous_batch_stops(progress: dict) -> tuple[bool, list]:
+    """Return (blocked, triggered_rules).
+    blocked=True means the most recently completed batch has unacknowledged
+    stop conditions and the next batch must NOT advance.
+    triggered_rules is a list of dicts (the report's `triggered` array) when
+    blocked=True; empty otherwise."""
+    prev = _previous_completed_batch(progress)
+    if prev is None:
+        return False, []
+    batch_dir = f'{SAMPLE_DIR}/batch-{prev:02d}'
+    stop_path = f'{batch_dir}/stop_conditions.json'
+    ack_path = f'{batch_dir}/.stops-acknowledged'
+    if not os.path.exists(stop_path):
+        # Pre-feature batch (no stop file written) — let through. The gate
+        # only enforces on batches whose mark-completed ran post-feature.
+        return False, []
+    report = json.load(open(stop_path))
+    triggered = report.get('triggered', [])
+    if not triggered:
+        return False, []
+    if os.path.exists(ack_path):
+        return False, []
+    # Annotate triggered rules with the prior batch number for the error message.
+    for t in triggered:
+        t['_batch'] = prev
+    return True, triggered
+
+
+def cmd_ack_stops(args: argparse.Namespace) -> None:
+    """Acknowledge the stop conditions triggered by batch N. Writes
+    batch-NN/.stops-acknowledged with the operator's reason for audit.
+    `next-batch` then advances past the gate."""
+    batch_dir = f'{SAMPLE_DIR}/batch-{args.batch:02d}'
+    stop_path = f'{batch_dir}/stop_conditions.json'
+    ack_path = f'{batch_dir}/.stops-acknowledged'
+    if not os.path.exists(stop_path):
+        sys.exit(f"No stop_conditions.json for batch {args.batch} at "
+                 f"{stop_path}. Run `mark-completed --batch {args.batch}` "
+                 f"first to generate it.")
+    report = json.load(open(stop_path))
+    triggered = report.get('triggered', [])
+    if not triggered:
+        sys.exit(f"Batch {args.batch} has no triggered stop conditions — "
+                 f"nothing to acknowledge. {stop_path} shows "
+                 f"{report.get('evaluated_count', 0)} rule(s) evaluated, 0 triggered.")
+    payload = {
+        'batch': args.batch,
+        'acknowledged_at': _now(),
+        'reason': args.reason,
+        'triggered_when_acknowledged': [t['name'] for t in triggered],
+    }
+    with open(ack_path, 'w') as f:
+        json.dump(payload, f, indent=2)
+    print(f"wrote {ack_path}")
+    print(f"  acknowledged {len(triggered)} stop condition(s): "
+          f"{', '.join(t['name'] for t in triggered)}")
+    print(f"  reason: {args.reason}")
+    print(f"  next-batch is now unblocked.")
 
 
 def cmd_aggregate_batch(args: argparse.Namespace) -> None:
@@ -1001,6 +1233,19 @@ def main() -> None:
     p_stat.add_argument('-v', '--verbose', action='store_true',
                         help='Show per-batch detail.')
     p_stat.set_defaults(func=cmd_status)
+
+    p_ack = sub.add_parser(
+        'ack-stops',
+        help="Acknowledge a completed batch's triggered stop conditions so "
+             "next-batch can proceed. Records the reason for audit.")
+    p_ack.add_argument('--batch', type=int, required=True,
+                       help='The completed batch whose stop conditions you '
+                            'are acknowledging.')
+    p_ack.add_argument('--reason', required=True,
+                       help='One-line explanation of why it is safe to '
+                            'continue past the triggered rules. Stored in '
+                            'batch-NN/.stops-acknowledged.')
+    p_ack.set_defaults(func=cmd_ack_stops)
 
     args = ap.parse_args()
     args.func(args)
