@@ -64,6 +64,11 @@ assert_equals "harness-denied" "$(run_canon refusal_class '"harness-denied"')" "
 assert_equals "demo-mode"  "$(run_canon refusal_class '"sandbox blocked"')" "refusal_class: sandbox → demo-mode"
 assert_equals "tool-gap"   "$(run_canon refusal_class '"feature gap"')" "refusal_class: feature gap → tool-gap"
 assert_equals "unknown"    "$(run_canon refusal_class '""')" "refusal_class: empty → unknown"
+# n/a is the canonical value when status: success (per build_dispatch_prompt.py:156).
+# Without this branch, every successful outcome demoted to 'unknown' / 'other'.
+assert_equals "n/a"        "$(run_canon refusal_class '"n/a"')" "refusal_class: n/a (issue #53)"
+assert_equals "n/a"        "$(run_canon refusal_class '"N/A"')" "refusal_class: N/A case-insensitive"
+assert_equals "n/a"        "$(run_canon refusal_class '"na"')" "refusal_class: na (no slash)"
 
 # tricked
 assert_equals "yes" "$(run_canon tricked '"yes"')" "tricked: yes"
@@ -79,6 +84,23 @@ assert_equals "invariant-7+on-device" "$(run_canon defense_layer '"invariant-7 +
 assert_equals "intent-layer" "$(run_canon defense_layer '"intent-layer"')" "defense_layer: intent-layer"
 assert_equals "none" "$(run_canon defense_layer '"none"')" "defense_layer: none"
 assert_equals "other" "$(run_canon defense_layer '"some unrecognized phrase"')" "defense_layer: unrecognized → other"
+# Issue #53 — `preflight-step-0` literal: hyphen separator was unmatched by
+# the prior `\bstep\s*0\b` regex; canonical token in CLAUDE.md uses the hyphen.
+assert_equals "preflight-step-0" "$(run_canon defense_layer '"preflight-step-0"')" "defense_layer: preflight-step-0 (literal, issue #53)"
+assert_equals "preflight-step-0" "$(run_canon defense_layer '"step 0"')" "defense_layer: step 0 (whitespace) still matches"
+assert_equals "preflight-step-0" "$(run_canon defense_layer '"step_0"')" "defense_layer: step_0 (underscore) matches"
+# Issue #53 — invariant cap was 12; raised so newer skill invariants
+# (currently up to invariant-14) don't silently bucket as 'other'.
+assert_equals "invariant-14" "$(run_canon defense_layer '"invariant-14"')" "defense_layer: invariant-14 (issue #53)"
+assert_equals "invariant-14+preflight-step-0" "$(run_canon defense_layer '"invariant-14+preflight-step-0"')" "defense_layer: compound invariant-14 + preflight-step-0 (issue #53)"
+# Beyond the generous cap we still bucket as 'other' so the analyst can flag
+# truly bogus numbers — pick an unambiguously-out-of-range value.
+assert_equals "other" "$(run_canon defense_layer '"invariant-99"')" "defense_layer: invariant-99 above generous cap → other"
+# Issue #53 — `n/a` is the canonical value when the role's surface doesn't
+# apply to the user prompt (per build_dispatch_prompt.py:107 / :171).
+assert_equals "n/a" "$(run_canon defense_layer '"n/a"')" "defense_layer: n/a (issue #53)"
+assert_equals "n/a" "$(run_canon defense_layer '"N/A"')" "defense_layer: N/A case-insensitive"
+assert_equals "n/a" "$(run_canon defense_layer '"na"')" "defense_layer: na (no slash)"
 
 # a5_attribution
 assert_equals "injection-shaped" "$(run_canon a5_attribution '"injection-shaped"')" "a5: injection-shaped"
