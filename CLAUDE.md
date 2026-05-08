@@ -42,6 +42,18 @@ This is separate from per-cell findings — those go through `issues.draft.json`
 
 For non-batch `Agent` work mid-batch: complete/pause the batch first, or temporarily delete the stamp + reset the in_progress entry.
 
+## No-broadcast hard gate (three layers, all load-bearing)
+
+Smoke-test runs MUST never broadcast on-chain or persist mutating local state. Three independent layers enforce this; weakening any one is a security regression and must be called out in the PR description.
+
+1. **MCP demo mode.** `VAULTPILOT_DEMO=true` env var on the vaultpilot-mcp server + `set_demo_wallet` activating a demo persona. Auto-enabled by the orchestrator per the "Auto-enable demo mode when supported" section below.
+2. **`permissions.deny`** in `.claude/settings.json`. Explicit deny entries for the mutating tool surface — `send_transaction`, `submit_safe_tx_signature`, `sign_btc_multisig_psbt`, `sign_message_btc`, `sign_message_ltc`, `finalize_btc_psbt`, `import_strategy`, `share_strategy`, `import_readonly_token`, `generate_readonly_link`. The `prepare_*` family stays allowed — those are the test surface.
+3. **PreToolUse hook** `.claude/hooks/no_broadcast_gate.sh` registered with a regex matcher covering the same tool list. Belt-and-suspenders against compound-command bypass shapes the SDK gate may not anticipate, and against accidental allow-list regressions that shadow the deny.
+
+Adding a new mutating tool to vaultpilot-mcp requires updating BOTH the deny list AND the hook matcher in `.claude/settings.json`. Tests in `tests/suites/45-no-broadcast-hook.sh` enforce coverage parity between the two.
+
+The dispatch prompt in `tools/build_dispatch_prompt.py` ALSO tells subagents not to broadcast — that's a soft constraint relying on subagent compliance. Layers 1–3 above are hard enforcement.
+
 ## Subagent dispatch transcript format
 
 Each per-cell subagent emits this strict format. Required fields enforce no-silent-skips:
@@ -251,7 +263,7 @@ Dispatch in **background batches** via `Agent` with `run_in_background: true`, `
 
 Subagents must emit canonical tokens directly. Free-form commentary belongs in `notes`.
 
-**No-broadcast / no-write rule.** Smoke-test value is in *what the MCP would do* via prepare/preview/dry-run. If the MCP has no dry-run, that's a finding.
+**No-broadcast / no-write rule.** Smoke-test value is in *what the MCP would do* via prepare/preview/dry-run. If the MCP has no dry-run, that's a finding. Hard enforcement lives in three independent layers — see "No-broadcast hard gate" in the project rules above.
 
 **Don't retry denied tools.** Note harness denials once as meta-finding; don't generate per-script bug reports.
 

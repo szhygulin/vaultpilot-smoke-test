@@ -9,6 +9,15 @@
             "command": ".claude/hooks/preflight_gate.sh"
           }
         ]
+      },
+      {
+        "matcher": "mcp__vaultpilot-mcp__(send_transaction|submit_safe_tx_signature|sign_btc_multisig_psbt|sign_message_btc|sign_message_ltc|finalize_btc_psbt|import_strategy|share_strategy|import_readonly_token|generate_readonly_link)",
+        "hooks": [
+          {
+            "type": "command",
+            "command": ".claude/hooks/no_broadcast_gate.sh"
+          }
+        ]
       }
     ]
   },
@@ -55,6 +64,18 @@
       "Bash(git status *)",
       "Bash(git diff *)",
       "Bash(git branch *)"
+    ],
+    "deny": [
+      "mcp__vaultpilot-mcp__send_transaction",
+      "mcp__vaultpilot-mcp__submit_safe_tx_signature",
+      "mcp__vaultpilot-mcp__sign_btc_multisig_psbt",
+      "mcp__vaultpilot-mcp__sign_message_btc",
+      "mcp__vaultpilot-mcp__sign_message_ltc",
+      "mcp__vaultpilot-mcp__finalize_btc_psbt",
+      "mcp__vaultpilot-mcp__import_strategy",
+      "mcp__vaultpilot-mcp__share_strategy",
+      "mcp__vaultpilot-mcp__import_readonly_token",
+      "mcp__vaultpilot-mcp__generate_readonly_link"
     ]
   }
 }
