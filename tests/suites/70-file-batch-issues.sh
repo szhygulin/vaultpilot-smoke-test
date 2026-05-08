@@ -173,5 +173,151 @@ assert_file_contains "runs/matrix-sampled/batch-97/advisory-upstream.md" \
 assert_file_contains "runs/matrix-sampled/batch-97/advisory-upstream.md" \
     "advisory-injection-shaped" "advisory-upstream.md includes the attribution"
 
+# ---------------------------------------------------------------------------
+# Tests 6–10: cross-batch dedup (--dedup + --on-dup).
+#
+# We mock `gh` by prepending a fake binary on PATH. The mock handles only
+# `gh issue list`, returning the contents of $GH_MOCK_LIST_RESPONSE, and is
+# inert for `gh issue create` / `gh issue comment` (these are gated by
+# --dry-run, which short-circuits both code paths before any subprocess call).
+# ---------------------------------------------------------------------------
+mkdir -p "$TMP/bin"
+cat > "$TMP/bin/gh" <<'MOCK_GH'
+#!/bin/bash
+# Mock gh binary for tests/suites/70-file-batch-issues.sh — exercises the
+# --dedup path without touching real GitHub. Reads canned JSON response from
+# $GH_MOCK_LIST_RESPONSE; defaults to an empty array when unset.
+if [[ "$1" == "issue" && "$2" == "list" ]]; then
+  if [[ -n "${GH_MOCK_LIST_RESPONSE:-}" && -f "$GH_MOCK_LIST_RESPONSE" ]]; then
+    cat "$GH_MOCK_LIST_RESPONSE"
+  else
+    echo "[]"
+  fi
+  exit 0
+fi
+echo "MOCK GH: unsupported command in dedup tests: $*" >&2
+exit 1
+MOCK_GH
+chmod +x "$TMP/bin/gh"
+ORIG_PATH="$PATH"
+export PATH="$TMP/bin:$PATH"
+
+# Canned dedup-match payload: one open issue whose title-stem overlaps draft
+# #1 ("missing intent-layer refusal on prepare_custom_call") AND shares the
+# `security_finding` label.
+cat > "$TMP/match-payload.json" <<'PAYLOAD'
+[
+  {
+    "number": 9001,
+    "title": "Missing intent-layer refusal on prepare_custom_call",
+    "url": "https://github.com/synth/repo/issues/9001",
+    "labels": [{"name": "security_finding"}, {"name": "skill_finding"}]
+  }
+]
+PAYLOAD
+
+# Canned no-match payload: candidate share label but title-stem disjoint.
+cat > "$TMP/nomatch-payload.json" <<'PAYLOAD'
+[
+  {
+    "number": 7777,
+    "title": "Wholly unrelated finding about Solana fee accounting",
+    "url": "https://github.com/synth/repo/issues/7777",
+    "labels": [{"name": "security_finding"}]
+  }
+]
+PAYLOAD
+
+# Test 6: --dedup with a match + default --on-dup=link → suppresses new filing,
+# would-link in dry-run, dedup.log records MATCH.
+rm -f runs/matrix-sampled/batch-99/dedup.log
+set +e
+OUT=$(GH_MOCK_LIST_RESPONSE="$TMP/match-payload.json" \
+      python3 tools/file_batch_issues.py --batch 99 --repo synth/repo \
+      --dry-run --dedup --only 1 2>&1)
+EC=$?
+set -e
+assert_exit_code 0 "$EC" "--dedup match + link → exit 0"
+assert_contains "$OUT" "dedup match: #9001" "match #9001 surfaced"
+assert_contains "$OUT" "action=link" "default action is link"
+assert_contains "$OUT" "DRY-RUN-COMMENT-#9001" "dry-run comment placeholder rendered"
+assert_not_contains "$OUT" "[dry-run] [mcp-defect]" \
+    "no fresh issue create line on dedup hit"
+assert_file_exists "runs/matrix-sampled/batch-99/dedup.log" "dedup.log written"
+assert_file_contains "runs/matrix-sampled/batch-99/dedup.log" \
+    "MATCH #9001" "dedup.log records the match"
+assert_file_contains "runs/matrix-sampled/batch-99/dedup.log" \
+    "mode: dry-run, on-dup: link" "dedup.log header records mode + on-dup"
+
+# Test 7: --dedup with no match → falls through to normal filing, dedup.log
+# records NO MATCH for that draft.
+rm -f runs/matrix-sampled/batch-99/dedup.log
+set +e
+OUT=$(GH_MOCK_LIST_RESPONSE="$TMP/nomatch-payload.json" \
+      python3 tools/file_batch_issues.py --batch 99 --repo synth/repo \
+      --dry-run --dedup --only 1 2>&1)
+EC=$?
+set -e
+assert_exit_code 0 "$EC" "--dedup no-match → exit 0"
+assert_not_contains "$OUT" "dedup match:" "no match line printed"
+assert_contains "$OUT" "[dry-run] [mcp-defect]" \
+    "fresh issue create line still printed on no-match"
+assert_file_contains "runs/matrix-sampled/batch-99/dedup.log" \
+    "NO MATCH" "dedup.log records no-match for #1"
+
+# Test 8: --dedup --on-dup=skip with a match → skip without commenting.
+rm -f runs/matrix-sampled/batch-99/dedup.log
+set +e
+OUT=$(GH_MOCK_LIST_RESPONSE="$TMP/match-payload.json" \
+      python3 tools/file_batch_issues.py --batch 99 --repo synth/repo \
+      --dry-run --dedup --on-dup skip --only 1 2>&1)
+EC=$?
+set -e
+assert_exit_code 0 "$EC" "--dedup --on-dup=skip → exit 0"
+assert_contains "$OUT" "action=skip" "skip action wired"
+assert_contains "$OUT" "skipped (dup of #9001)" "skip message rendered"
+assert_not_contains "$OUT" "DRY-RUN-COMMENT" "no comment in skip mode"
+assert_not_contains "$OUT" "[dry-run] [mcp-defect]" \
+    "no fresh issue created in skip mode"
+assert_file_contains "runs/matrix-sampled/batch-99/dedup.log" \
+    "action: skip" "dedup.log records skip action"
+
+# Test 9: --dedup --on-dup=file with a match → file new issue anyway.
+rm -f runs/matrix-sampled/batch-99/dedup.log
+set +e
+OUT=$(GH_MOCK_LIST_RESPONSE="$TMP/match-payload.json" \
+      python3 tools/file_batch_issues.py --batch 99 --repo synth/repo \
+      --dry-run --dedup --on-dup file --only 1 2>&1)
+EC=$?
+set -e
+assert_exit_code 0 "$EC" "--dedup --on-dup=file → exit 0"
+assert_contains "$OUT" "action=file" "file action wired"
+assert_contains "$OUT" "[dry-run] [mcp-defect]" \
+    "fresh issue create line printed despite match"
+
+# Test 10: gh-search failure (mock returns non-zero) → falls through to
+# file-new with stderr warning, no match recorded.
+cat > "$TMP/bin/gh" <<'MOCK_GH_FAIL'
+#!/bin/bash
+echo "synthetic gh failure" >&2
+exit 1
+MOCK_GH_FAIL
+chmod +x "$TMP/bin/gh"
+rm -f runs/matrix-sampled/batch-99/dedup.log
+set +e
+OUT=$(python3 tools/file_batch_issues.py --batch 99 --repo synth/repo \
+      --dry-run --dedup --only 1 2>&1)
+EC=$?
+set -e
+assert_exit_code 0 "$EC" "gh-search failure → exit 0 (graceful fall-through)"
+assert_contains "$OUT" "dedup search failed" "search failure surfaced"
+assert_contains "$OUT" "[dry-run] [mcp-defect]" \
+    "fall-through files the new issue"
+assert_file_contains "runs/matrix-sampled/batch-99/dedup.log" \
+    "NO MATCH" "search-fail logs NO MATCH (no candidate returned)"
+
+# Restore PATH so subsequent suites don't see the mock gh.
+export PATH="$ORIG_PATH"
+
 cd "$REPO_ROOT"
 echo ""

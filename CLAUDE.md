@@ -9,7 +9,7 @@
 
 ## Test workdir stays inside this repo
 
-All smoke-test artifacts (`scripts.json`, `transcripts/`, `summary.txt`, `aggregate.json`, `findings.md`, `issues.draft.json`, `issues.md`) live under `runs/matrix-sampled/batch-NN/` in this repo. Never create a workdir outside the repo. `tools/sample_matrix_run.py next-batch`, `/run-batch`, `tools/post_batch_commit.sh`, and the Lane 3 PreToolUse hook all assume in-repo paths. If you need a one-off test outside, surface the reason first.
+All smoke-test artifacts (`scripts.json`, `transcripts/`, `summary.txt`, `aggregate.json`, `findings.md`, `issues.draft.json`, `issues.md`, `dedup.log`) live under `runs/matrix-sampled/batch-NN/` in this repo. Never create a workdir outside the repo. `tools/sample_matrix_run.py next-batch`, `/run-batch`, `tools/post_batch_commit.sh`, and the Lane 3 PreToolUse hook all assume in-repo paths. If you need a one-off test outside, surface the reason first.
 
 ## mcp-smoke-test methodology is binding
 
@@ -265,7 +265,7 @@ A "go" through the quality gate, like Phase 2.5's "go", is per-batch. Re-tuning 
 1. Dispatch (Phase 3).
 2. `mark-completed --batch N` auto-aggregates → `summary.txt` + `aggregate.json`. Surfaces by-role counts, defense-layer firings, and `did_user_get_tricked: yes` SCRIPT_IDs.
 3. Delegate fresh analysis subagent (`model: "opus"`) over `batch-NN/summary.txt`, scoped to "this batch's N cells". Emits two artifacts: `findings.md` (prose, sections 1–6) + `issues.draft.json` (structured, one entry per §6 finding).
-4. File via `tools/file_batch_issues.py` (do NOT re-construct issue bodies inline). Confirm with `--dry-run` first; file with user approval.
+4. File via `tools/file_batch_issues.py --dedup` (do NOT re-construct issue bodies inline). The `--dedup` flag is mandatory for matrix runs: it searches the target repo's open issues per draft and posts a cross-batch comment to a matched existing issue instead of filing a duplicate. Confirm with `--dry-run --dedup` first (writes `dedup.log` for the upcoming GATE 2 table); file with user approval. Default match action is `link`; pass `--on-dup=skip` if the user wants quieter triage.
 5. Optional: cumulative analysis over all `batch-NN/summary.txt` once cross-batch patterns matter. Skip by default.
 
 Why per-batch instead of one final cumulative: matrix runs span weeks. Per-batch analysis lets the user catch a systemic failure early and stop dispatching against a broken defense.
@@ -478,7 +478,8 @@ Agent honest, MCP honest, but upstream RPC returns tampered chain reads (balance
 ├── aggregate.json
 ├── findings.md
 ├── issues.draft.json
-└── issues.md
+├── issues.md
+└── dedup.log               # written by --dedup; one line per draft (MATCH #N / NO MATCH)
 ```
 
 ## When to skip this skill

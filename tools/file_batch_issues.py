@@ -16,6 +16,8 @@ Usage:
       --skill-repo owner/skill-repo --advisory-repo owner/upstream
   python3 tools/file_batch_issues.py --batch N --repo owner/repo \\
       --strict-attribution
+  python3 tools/file_batch_issues.py --batch N --repo owner/repo --dedup
+  python3 tools/file_batch_issues.py --batch N --repo owner/repo --dedup --on-dup=skip
 
 Routing by `attribution`:
   - mcp-defect              → --repo (required; default destination)
@@ -29,6 +31,28 @@ Unrouted issues are written to `runs/matrix-sampled/batch-NN/advisory-upstream.m
 and NOT filed against any repo. This stops advisory-prose-only findings from
 being filed against vaultpilot-mcp by default (per issue #52). To file them
 upstream, pass `--advisory-repo <repo>`.
+
+Cross-batch dedup (`--dedup`):
+  Matrix runs span ~1000 batches; the same finding class will recur across
+  batches. With `--dedup`, the script searches the per-issue target repo's
+  open issues via `gh issue list --search "<title-stem>" --state open`
+  before filing. A match is declared when the candidate's normalized title
+  stem overlaps the draft's stem AND the candidate shares at least one label
+  with the draft (when the draft has labels). Search target is the per-issue
+  routed repo (mcp-defect → --repo, skill-defect → --skill-repo,
+  advisory-* → --advisory-repo) — unrouted issues are not searched.
+
+  On match, behavior is controlled by `--on-dup`:
+    - link    (default): post a cross-batch comment on the existing issue
+                         with this batch's repro IDs and source link; do not
+                         file a new issue.
+    - skip              : skip both filing and commenting; just log.
+    - file              : ignore the match and file a new issue anyway.
+    - prompt            : interactive prompt asking link / file / skip per
+                          match (requires a TTY; falls back to `link` if not).
+
+  Decisions are logged to `runs/matrix-sampled/batch-NN/dedup.log` for audit
+  whenever `--dedup` is set, regardless of `--dry-run`.
 
 Input schema (`issues.draft.json`):
 {
@@ -76,6 +100,7 @@ Pre-reqs:
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -92,6 +117,15 @@ ATTRIBUTION_TO_FLAG = {
     "advisory-model-shaped": "advisory_repo",
 }
 KNOWN_ATTRIBUTIONS = set(ATTRIBUTION_TO_FLAG.keys())
+
+# Cross-batch dedup tunables.
+# `--search` returns up to N candidates ranked by GitHub's relevance score; we
+# re-filter locally on title-stem overlap + label intersection.
+_DEDUP_SEARCH_LIMIT = 30
+
+# Words shorter than this are dropped when extracting a stable search stem; they
+# inflate the result set without narrowing it (gh's search is keyword-based).
+_DEDUP_MIN_KEYWORD_LEN = 4
 
 
 def _batch_dir(batch_n: int) -> Path:
@@ -152,6 +186,183 @@ def _route(issue: dict, repos: dict, strict_attribution: bool) -> tuple:
     if target is None:
         return None, attribution, "unrouted-no-flag"
     return target, attribution, "routed"
+
+
+def _title_stem(title: str) -> str:
+    """Normalize a title for cross-batch comparison.
+
+    - Lowercase.
+    - Strip leading bracketed prefixes ("[A.5a] ", "[batch-12] ").
+    - Drop trailing batch references (" (batch 12)", " — batch-12", "(b12)").
+    - Collapse whitespace.
+
+    The stem is used for two things: (1) building the `gh issue list --search`
+    query, and (2) substring-comparing against returned candidates' stems to
+    re-filter relevance-ranked noise.
+    """
+    s = title.strip().lower()
+    # Drop trailing batch refs in any common shape.
+    s = re.sub(
+        r"\s*[—\-–]?\s*\(?\s*batch[\s\-]*\d+\s*\)?\s*$",
+        "",
+        s,
+    )
+    # Drop leading bracketed prefixes.
+    s = re.sub(r"^\[[^\]]+\]\s*", "", s)
+    # Collapse whitespace.
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def _search_query(stem: str) -> str:
+    """Reduce a title stem to a keyword query for `gh issue list --search`.
+
+    Strategy: keep tokens that are alphanumeric + length >= _DEDUP_MIN_KEYWORD_LEN,
+    cap to 6 tokens to avoid hyper-specific queries that miss close matches.
+    Drops common smoke-test boilerplate words ("issue", "smoke") that don't
+    narrow the search.
+    """
+    stop = {
+        "issue", "smoke", "with", "from", "this", "that", "when", "what",
+        "where", "their", "would", "could", "should",
+    }
+    tokens = re.findall(r"[a-z0-9_]+", stem)
+    keep = [
+        t for t in tokens
+        if len(t) >= _DEDUP_MIN_KEYWORD_LEN and t not in stop
+    ]
+    return " ".join(keep[:6])
+
+
+def _search_existing_issues(repo: str, draft_issue: dict) -> dict | None:
+    """Search `repo`'s open issues for one matching `draft_issue`.
+
+    Returns the matched candidate as a dict
+    `{"number", "title", "url", "labels": [str, ...]}` on a confident match,
+    or None on no match / search failure.
+
+    A match requires:
+      - non-empty title-stem overlap (substring either direction), AND
+      - non-empty label intersection (when the draft has labels; if the draft
+        has none, label-intersection is skipped).
+    """
+    stem = _title_stem(draft_issue["title"])
+    query = _search_query(stem)
+    if not query:
+        return None
+    cmd = [
+        "gh", "issue", "list",
+        "--repo", repo,
+        "--state", "open",
+        "--search", query,
+        "--json", "number,title,labels,url",
+        "--limit", str(_DEDUP_SEARCH_LIMIT),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"  ⚠ dedup search failed ({result.stderr.strip()[:120]}); "
+              f"falling through to file-new", file=sys.stderr)
+        return None
+    try:
+        candidates = json.loads(result.stdout or "[]")
+    except json.JSONDecodeError:
+        print(f"  ⚠ dedup search returned non-JSON; falling through to file-new",
+              file=sys.stderr)
+        return None
+    draft_labels = set(draft_issue.get("labels") or [])
+    for c in candidates:
+        c_stem = _title_stem(c.get("title", ""))
+        if not c_stem:
+            continue
+        if not (stem in c_stem or c_stem in stem):
+            continue
+        c_labels = {l["name"] for l in c.get("labels") or []}
+        if draft_labels and not (draft_labels & c_labels):
+            continue
+        return {
+            "number": c["number"],
+            "title": c["title"],
+            "url": c["url"],
+            "labels": sorted(c_labels),
+        }
+    return None
+
+
+def _format_dedup_comment(
+    draft_issue: dict, batch_n: int, source_attribution: str | None,
+) -> str:
+    """Compose the cross-batch comment body posted to a matched existing issue."""
+    parts = [
+        f"## Cross-batch dedup\n\n",
+        f"This finding class also surfaced in **batch-{batch_n}** "
+        f"(matrix-sampled smoke-test run).\n\n",
+    ]
+    repro = (draft_issue.get("repro") or "").strip()
+    if repro:
+        parts += ["**This batch's repro:**\n\n", repro, "\n\n"]
+    suggested = (draft_issue.get("suggested_fix") or "").strip()
+    if suggested:
+        parts += ["**Suggested fix (from this batch):**\n\n", suggested, "\n\n"]
+    attribution = draft_issue.get("attribution", "mcp-defect")
+    parts += [f"**Attribution:** `{attribution}`.\n\n"]
+    parts += ["## Source\n"]
+    if source_attribution:
+        parts += [source_attribution.strip(), "\n\n"]
+    else:
+        parts += [
+            f"Smoke-test batch-{batch_n} (matrix-sampled adversarial run). "
+            f"Findings: `runs/matrix-sampled/batch-{batch_n:02d}/findings.md`.\n\n"
+        ]
+    parts += [
+        "🤖 Filed by `tools/file_batch_issues.py --dedup` "
+        "(cross-batch dedup hit).\n"
+    ]
+    return "".join(parts)
+
+
+def _post_dup_comment(
+    repo: str, issue_number: int, body: str, dry_run: bool,
+) -> str:
+    """Post a comment on `issue_number` in `repo`. Returns URL or sentinel."""
+    if dry_run:
+        return f"DRY-RUN-COMMENT-#{issue_number}"
+    cmd = [
+        "gh", "issue", "comment", str(issue_number),
+        "--repo", repo,
+        "--body", body,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"  ✗ dedup-comment FAILED: {result.stderr.strip()[:120]}",
+              file=sys.stderr)
+        return f"FAILED-COMMENT — {result.stderr.strip()[:80]}"
+    return result.stdout.strip()
+
+
+def _resolve_dup_action(default_action: str, draft_idx: int,
+                        draft_title: str, match: dict) -> str:
+    """Resolve the on-dup action — `prompt` reads stdin if interactive."""
+    if default_action != "prompt":
+        return default_action
+    if not sys.stdin.isatty():
+        # Non-interactive context (CI, background dispatch); prompt is unsafe.
+        # Fall back to link, the orchestrator's preferred matrix-run default.
+        return "link"
+    print(
+        f"  [DUP CANDIDATE] draft #{draft_idx} \"{draft_title[:80]}\"\n"
+        f"      matches existing #{match['number']} "
+        f"\"{match['title'][:80]}\" — {match['url']}"
+    )
+    while True:
+        choice = input("    action? [l]ink / [s]kip / [f]ile / [q]uit: ").strip().lower()
+        if choice in ("l", "link"):
+            return "link"
+        if choice in ("s", "skip"):
+            return "skip"
+        if choice in ("f", "file"):
+            return "file"
+        if choice in ("q", "quit"):
+            sys.exit("aborted at dedup prompt")
 
 
 def _file_one(issue: dict, body: str, repo: str, dry_run: bool,
@@ -257,6 +468,26 @@ def _write_advisory_summary(batch_n: int,
     return out_path
 
 
+def _write_dedup_log(
+    batch_n: int, dry_run: bool, on_dup: str, lines: list[str],
+) -> None:
+    """Write `runs/matrix-sampled/batch-NN/dedup.log` for this --dedup pass.
+
+    Overwrites any prior log for the same batch — the log reflects the most
+    recent --dedup invocation rather than accumulating across reruns. Audit
+    history lives in git and in the appended issues.md.
+    """
+    log_path = _batch_dir(batch_n) / "dedup.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    header = (
+        f"# dedup.log — batch-{batch_n}\n"
+        f"# mode: {'dry-run' if dry_run else 'live'}, on-dup: {on_dup}\n"
+        f"# entries: {len(lines)}\n\n"
+    )
+    log_path.write_text(header + "".join(lines))
+    print(f"\nWrote dedup decisions to {log_path} ({len(lines)} entries)")
+
+
 def _append_to_issues_md(batch_n: int, urls: list[tuple]) -> None:
     """Append the filed-issue table to runs/matrix-sampled/batch-NN/issues.md."""
     md_path = _batch_dir(batch_n) / "issues.md"
@@ -305,6 +536,16 @@ def main() -> None:
     ap.add_argument("--exclude", default=None,
                     help="Comma-separated 1-based indices to skip (e.g. '2,4'); "
                          "default: none. Mutually exclusive with --only.")
+    ap.add_argument("--dedup", action="store_true",
+                    help="Search each issue's routed target repo for matching "
+                         "title-stem + labels before filing. Default off "
+                         "(preserves legacy behavior). Unrouted issues are not "
+                         "searched.")
+    ap.add_argument("--on-dup", default="link",
+                    choices=("link", "skip", "file", "prompt"),
+                    help="Action on dedup match: link a comment to the existing "
+                         "issue (default), skip filing entirely, file a new "
+                         "issue anyway, or interactively prompt per match.")
     args = ap.parse_args()
 
     draft_path = _batch_dir(args.batch) / "issues.draft.json"
@@ -360,6 +601,8 @@ def main() -> None:
     print(f"  --advisory-repo:         {args.advisory_repo or '(unset, advisory-* → unrouted)'}")
     if args.strict_attribution:
         print(f"  --strict-attribution:    on (missing-attribution issues will be skipped)")
+    if args.dedup:
+        print(f"  --dedup:                 on (on-dup={args.on_dup})")
     if fallback_warnings:
         print(f"  WARNING: {len(fallback_warnings)} issue(s) with no `attribution` "
               f"field; falling back to mcp-defect "
@@ -368,15 +611,57 @@ def main() -> None:
     print()
 
     urls = []
+    dedup_log_lines: list[str] = []
     for idx, issue, target, eff_attr, reason in plan:
         if target is None:
             _print_unrouted(issue, idx, len(issues), eff_attr, reason)
             continue
         body = _format_body(issue, args.batch, draft.get("source_attribution"))
         print(f"[{idx}/{len(issues)}] {issue['title'][:80]}")
-        url = _file_one(issue, body, target, args.dry_run, eff_attr)
-        if url and not url.startswith("FAILED"):
-            print(f"  ✓ {url}")
+
+        match = None
+        action = "file"
+        if args.dedup:
+            match = _search_existing_issues(target, issue)
+            if match:
+                action = _resolve_dup_action(
+                    args.on_dup, idx, issue["title"], match,
+                )
+                marker = "[would]" if args.dry_run else "[acting]"
+                print(
+                    f"  ⤷ {marker} dedup match: "
+                    f"#{match['number']} \"{match['title'][:60]}\" "
+                    f"→ action={action}"
+                )
+                dedup_log_lines.append(
+                    f"[{idx}] {issue['title']}\n"
+                    f"    → MATCH #{match['number']} {match['url']} "
+                    f"(action: {action})\n"
+                )
+            else:
+                dedup_log_lines.append(
+                    f"[{idx}] {issue['title']}\n"
+                    f"    → NO MATCH (action: file)\n"
+                )
+
+        if match and action == "skip":
+            url = f"SKIPPED-DUP-#{match['number']}"
+            print(f"  ⤷ skipped (dup of #{match['number']})")
+        elif match and action == "link":
+            comment_body = _format_dedup_comment(
+                issue, args.batch, draft.get("source_attribution"),
+            )
+            comment_url = _post_dup_comment(
+                target, match["number"], comment_body, args.dry_run,
+            )
+            url = f"LINKED-#{match['number']} {comment_url}"
+            if not comment_url.startswith("FAILED"):
+                print(f"  ✓ linked dup comment on #{match['number']} → {comment_url}")
+        else:
+            # action == "file" (no match, or --on-dup=file overrides)
+            url = _file_one(issue, body, target, args.dry_run, eff_attr)
+            if url and not url.startswith("FAILED"):
+                print(f"  ✓ {url}")
         urls.append((idx, issue["title"], url, issue.get("labels", []), target))
 
     print("\n=== Summary ===")
@@ -387,6 +672,9 @@ def main() -> None:
         print(f"\n=== Unrouted ({len(unrouted)}) ===")
         for idx, issue, _, eff_attr, reason in unrouted:
             print(f"  #{idx}  [{eff_attr}]  ({reason})  {issue['title'][:80]}")
+
+    if args.dedup:
+        _write_dedup_log(args.batch, args.dry_run, args.on_dup, dedup_log_lines)
 
     # Write advisory-upstream.md unless this is a dry-run.
     # We pass ALL unrouted findings (advisory-* + skill-defect-without-flag +
