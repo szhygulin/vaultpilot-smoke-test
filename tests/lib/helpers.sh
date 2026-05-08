@@ -63,6 +63,15 @@ assert_file_exists() {
     fi
 }
 
+assert_file_not_exists() {
+    local path="$1" desc="$2"
+    if [[ ! -f "$path" ]]; then
+        _test_pass "$desc — $path absent"
+    else
+        _test_fail "$desc — $path unexpectedly present"
+    fi
+}
+
 assert_file_contains() {
     local path="$1" needle="$2" desc="$3"
     if [[ ! -f "$path" ]]; then

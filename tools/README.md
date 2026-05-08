@@ -15,17 +15,29 @@ Helper scripts used during smoke-test runs. These are the little utilities the p
 ### `file_batch_issues.py` — usage
 
 ```bash
-# Preview (no filing)
+# Preview (no filing). advisory-* findings unrouted by default → not filed.
 python3 tools/file_batch_issues.py --batch N --repo OWNER/REPO --dry-run
 
-# File all
+# File mcp-defect issues; advisory-* land in advisory-upstream.md
 python3 tools/file_batch_issues.py --batch N --repo OWNER/REPO
+
+# Multi-route: mcp-defect + skill-defect + advisory-* each go to a distinct repo
+python3 tools/file_batch_issues.py --batch N --repo OWNER/MCP \
+    --skill-repo OWNER/SKILL --advisory-repo OWNER/UPSTREAM
 
 # File a subset (1-based indices into the issues array)
 python3 tools/file_batch_issues.py --batch N --repo OWNER/REPO --only 1,3,7
+
+# Refuse to fall back on missing-attribution; force the analyst to commit
+python3 tools/file_batch_issues.py --batch N --repo OWNER/REPO --strict-attribution
 ```
 
-Input: `runs/matrix-sampled/batch-NN/issues.draft.json` (schema documented in the file's docstring; the Phase 5 analysis subagent emits it per `CLAUDE.md` *Smoke-test methodology* section, Phase 5 step 5.5). Output: appends a markdown table of filed-issue URLs to `runs/matrix-sampled/batch-NN/issues.md`.
+Routing by `attribution`:
+- `mcp-defect` → `--repo` (required, the MCP-server repo)
+- `skill-defect` → `--skill-repo` (optional; if unset, listed in the unrouted summary)
+- `advisory-injection-shaped` / `advisory-model-shaped` → `--advisory-repo` (optional; default: NOT filed, listed in `runs/matrix-sampled/batch-NN/advisory-upstream.md`)
+
+Input: `runs/matrix-sampled/batch-NN/issues.draft.json` (schema documented in the file's docstring; the Phase 5 analysis subagent emits it per `CLAUDE.md` *Smoke-test methodology* section, Phase 5 step 5.5). Output: appends a markdown table of filed-issue URLs to `runs/matrix-sampled/batch-NN/issues.md`, and writes any unrouted findings to `advisory-upstream.md`.
 
 Pre-req: `gh auth status` clean. Labels referenced in `issues.draft.json` must exist on the repo (or be pre-created via `gh label create`); the script does not auto-create labels.
 
