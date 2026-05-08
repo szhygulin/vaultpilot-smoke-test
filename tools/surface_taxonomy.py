@@ -67,13 +67,45 @@ ROLE_REQUIRED_SURFACES = {
 }
 
 
+# Roles whose harmful payload is agent-generated prose with no MCP/skill
+# trust boundary. Findings from these roles consistently bulk-close as
+# architectural / Rogue-Agent-Only at the MCP repo (canonical closure:
+# vaultpilot-mcp#536; recent batch closures #595/#596/#597/#598/#583/#584/
+# #585/#586 + earlier #540/#541/#543/#544). Defense lives at the chat-client
+# output filter (A.5a / C.5a injection-shaped) or Anthropic model-layer
+# safety (A.5b / C.5b model-shaped) — neither in scope for this MCP.
+#
+# Methodology already routes A.5 / C.5 findings to §7 upstream-escalation
+# rather than MCP/skill issue filing (see CLAUDE.md Role-A library and
+# vaultpilot-mcp-smoke-test#52). This filter complements that on the
+# generation side: skip dispatching cells whose findings we already know
+# we'll route upstream, saving Haiku throughput, Phase-5 Opus context, and
+# analyst attention.
+#
+# Override path: SAMPLE_MATRIX_NO_SURFACE_FILTER=1 bypasses the entire
+# surface filter (already wired through `_flatten_all` in
+# tools/sample_matrix_run.py), which re-includes A.5 / C.5 alongside the
+# other surface-filtered pairs — useful for an explicit re-validation run
+# of the upstream-escalation tracker.
+ROGUE_AGENT_ADVISORY_ROLES = {'A.5', 'C.5'}
+
+
 def is_low_yield(category: str, role: str) -> bool:
     """Return True if (category, role) is a low-yield pair the sampler should skip.
 
-    "Low yield" = the role's required surface doesn't overlap with what the
-    category exposes. Roles with empty required-surface (A.4, A.5, C.4, C.5,
-    E) apply anywhere and are never low-yield.
+    Two reasons a pair is low-yield:
+
+    1. Rogue-agent advisory: roles A.5 / C.5 produce harmful prose with no
+       MCP/skill trust boundary. Their findings always bulk-close as
+       architectural / out-of-scope at the MCP repo. Excluded for every
+       category — they have no defensible surface anywhere here.
+
+    2. Surface mismatch: the role's required surface doesn't overlap with
+       what the category exposes. Roles with empty required-surface (A.4,
+       C.4, E) apply anywhere and are never low-yield via this branch.
     """
+    if role in ROGUE_AGENT_ADVISORY_ROLES:
+        return True
     cat_surfaces = CATEGORY_SURFACES.get(category, {'signing', 'read'})
     role_required = ROLE_REQUIRED_SURFACES.get(role, set())
     if not role_required:

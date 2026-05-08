@@ -34,12 +34,22 @@ assert_equals "yes" "$(_check tax_regulatory C.1)" "tax_regulatory excludes C.1 
 assert_equals "yes" "$(_check tax_regulatory D)"   "tax_regulatory excludes D (skill-tamper)"
 assert_equals "yes" "$(_check tax_regulatory F)"   "tax_regulatory excludes F (rogue RPC)"
 
-# Test 2: surface-agnostic roles always kept
+# Test 2: surface-agnostic roles always kept (A.4, C.4, E)
+# A.5 / C.5 are explicitly excluded everywhere — see ROGUE_AGENT_ADVISORY_ROLES
+# in surface_taxonomy.py. Their findings always bulk-close as architectural
+# at the MCP repo (canonical: vaultpilot-mcp#536); excluding them at
+# generation time saves Haiku throughput + Phase-5 Opus context.
 assert_equals "no" "$(_check tax_regulatory A.4)"  "tax_regulatory keeps A.4 (planted context)"
-assert_equals "no" "$(_check tax_regulatory A.5)"  "tax_regulatory keeps A.5 (advisory)"
 assert_equals "no" "$(_check tax_regulatory C.4)"  "tax_regulatory keeps C.4 (collude context)"
-assert_equals "no" "$(_check tax_regulatory C.5)"  "tax_regulatory keeps C.5 (collude advisory)"
 assert_equals "no" "$(_check tax_regulatory E)"    "tax_regulatory keeps E (control)"
+
+# Test 2b: A.5 / C.5 (rogue-agent advisory) excluded everywhere
+assert_equals "yes" "$(_check tax_regulatory A.5)"     "tax_regulatory excludes A.5 (rogue-agent advisory)"
+assert_equals "yes" "$(_check tax_regulatory C.5)"     "tax_regulatory excludes C.5 (rogue-agent advisory)"
+assert_equals "yes" "$(_check send_native A.5)"        "send_native excludes A.5 (rogue-agent advisory)"
+assert_equals "yes" "$(_check send_native C.5)"        "send_native excludes C.5 (rogue-agent advisory)"
+assert_equals "yes" "$(_check edge_unsupported A.5)"   "edge_unsupported excludes A.5 (rogue-agent advisory)"
+assert_equals "yes" "$(_check brand_new_category A.5)" "unknown category excludes A.5 (rogue-agent advisory)"
 
 # Test 3: unknown category defaults to {signing, read} (kept by default)
 assert_equals "no" "$(_check brand_new_category A.1)" "unknown category keeps A.1 (default conservative)"
@@ -50,9 +60,12 @@ assert_equals "no" "$(_check brand_new_category F)"   "unknown category keeps F 
 assert_equals "no" "$(_check send_native A.1)" "send_native keeps A.1"
 assert_equals "no" "$(_check swap_cross D)"    "swap_cross keeps D"
 
-# Test 5: edge_unsupported special-case (only B + advisory roles kept)
+# Test 5: edge_unsupported special-case (only B + non-advisory surface-agnostic roles kept)
+# A.5 / C.5 are now globally excluded (Test 2b); edge_unsupported still keeps B
+# (the cell's purpose is "MCP spoofs success on unsupported chain") and the
+# remaining surface-agnostic roles (A.4, C.4, E).
 assert_equals "no"  "$(_check edge_unsupported B)"   "edge_unsupported keeps B (b-special)"
-assert_equals "no"  "$(_check edge_unsupported A.5)" "edge_unsupported keeps A.5 (advisory)"
+assert_equals "no"  "$(_check edge_unsupported A.4)" "edge_unsupported keeps A.4 (planted context)"
 assert_equals "no"  "$(_check edge_unsupported E)"   "edge_unsupported keeps E (control)"
 assert_equals "yes" "$(_check edge_unsupported A.1)" "edge_unsupported excludes A.1"
 assert_equals "yes" "$(_check edge_unsupported D)"   "edge_unsupported excludes D"
