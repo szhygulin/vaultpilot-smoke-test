@@ -9,3 +9,9 @@ node_modules/
 
 # tests/run-all.sh writes per-suite logs here on every run; not for tracking.
 tests/.last-run/
+
+# Per-batch preflight-confirmation stamp written by the orchestrator after the
+# user OKs the cost-preflight gate for THIS session. Pure runtime gate state —
+# committing it would let a fresh checkout of an old commit pass the PreToolUse
+# hook with no explicit confirmation in the new session.
+runs/matrix-sampled/**/.preflight-confirmed
