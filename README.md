@@ -211,7 +211,7 @@ This repo's smoke-test pipeline embeds methodology + tooling into CLAUDE.md (loa
 | --- | --- |
 | Block ALL `Agent` calls during in_progress batch (no smart matcher) | + Simple + loud + fail-safe. − Non-smoke-test Agent calls during a batch are blocked too; have to complete/pause batch first. |
 | Hook in `.claude/settings.json` (project scope) | + Repo-local; doesn't affect other projects. − Anyone cloning this repo gets the hook; documented in CLAUDE.md to avoid surprises. |
-| Stamp-file based (`.preflight-confirmed` per batch) | + Simple state machine; one file = "confirmed". − If the stamp is created without explicit user OK (e.g. by mistake), the gate is bypassed. Discipline: only `touch` after the user says "go". |
+| Content-bound stamp (`.preflight-confirmed` per batch, JSON `{batch, batchHash, confirmedAt}`) | + Hash binds confirmation to a snapshot of `scripts.json` + `progress[batch-N entry]`; drift between confirm and dispatch (regenerated scripts.json, mutated progress entry, prior-session committed stamp) is rejected by the hook. + Stamps older than `PREFLIGHT_TTL_HOURS` (default 6h) expire so stale confirmations from a prior session fail closed. − One more subcommand (`confirm-batch`) than `touch`; orchestrator must call it instead of `touch`. |
 
 ### Lane 1 — No silent skips
 

@@ -34,6 +34,12 @@ Subcommands:
                          Marks the batch as in_progress. Refuses to advance
                          if the previous batch triggered any stop condition
                          that hasn't been acknowledged via `ack-stops`.
+  confirm-batch --batch N
+                         Write a content-bound preflight stamp after user OK.
+                         Replaces the bare `touch .preflight-confirmed`.
+  verify-stamp --batch N
+                         Verify the preflight stamp matches current state
+                         (hash + TTL). Called by the PreToolUse hook.
   mark-completed --batch N [--transcripts PATH]
                          Mark batch N as completed. Auto-aggregates and
                          evaluates stop conditions (writes
@@ -50,6 +56,8 @@ Outputs (under runs/matrix-sampled/):
                          expected by the skill's Phase 3 dispatch.
 """
 import argparse
+import calendar
+import hashlib
 import json
 import os
 import random
@@ -58,7 +66,12 @@ import sys
 import time
 from collections import Counter
 
-REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# SAMPLE_MATRIX_REPO_ROOT overrides the auto-derived repo root. The mock test
+# suite (tests/suites/40-preflight-hook.sh) sets this to a tempdir so the
+# preflight hook + verify-stamp helper agree on which progress.json to read
+# without disturbing the real runs/ tree.
+REPO = os.environ.get('SAMPLE_MATRIX_REPO_ROOT',
+                      os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 MATRIX_PATH = f'{REPO}/test-vectors/matrix.json'
 CANARIES_PATH = f'{REPO}/tools/canaries.json'
 SAMPLE_DIR = f'{REPO}/runs/matrix-sampled'
@@ -1579,6 +1592,191 @@ def cmd_mark_completed(args: argparse.Namespace) -> None:
               f"have run.")
 
 
+# ---------------------------------------------------------------------------
+# Preflight stamp content-binding (issue #54)
+# ---------------------------------------------------------------------------
+# The stamp at runs/matrix-sampled/batch-NN/.preflight-confirmed used to be
+# presence-only — `touch` created an empty file, the PreToolUse hook checked
+# `[[ -f "$stamp" ]]`, every Agent dispatch passed regardless of what content
+# the user actually OK'd. Drift between confirm-time state and dispatch-time
+# state went undetected:
+#   1. Operator regenerated scripts.json after confirm — same stamp, new content.
+#   2. A stamp committed from a prior session passed silently on fresh checkout.
+#   3. Two batches in_progress at once — stamp on N treated as auth for M.
+#
+# Fix: bind the stamp to a content hash. Confirm writes JSON
+# `{batch, batchHash, confirmedAt, confirmedBy}`. The hook recomputes the hash
+# from current state and rejects on mismatch. A TTL catches stale stamps from
+# prior sessions even when the underlying content didn't change.
+#
+# Single point of truth: `_compute_batch_hash` is the only place the recipe
+# lives. Both `confirm-batch` and `verify-stamp` call it. Drift between two
+# recipes would silently re-introduce the gap.
+DEFAULT_PREFLIGHT_TTL_HOURS = 6.0  # covers batch-2's 3h17m dispatch + headroom
+
+
+def _compute_batch_hash(batch_n: int) -> str:
+    """sha256 of (scripts.json bytes) || '|' || (progress.json batch entry as
+    sorted-keys JSON). Used by both confirm-batch and verify-stamp.
+
+    Hash inputs:
+      - scripts.json: changes if next-batch is re-invoked (regenerates the
+        hydrated cell list, comment, ordering).
+      - progress[batch-N entry]: includes `started_at` which next-batch
+        rewrites when re-marking the batch in_progress; catches reset+regen
+        loops the operator does between confirm and dispatch.
+    """
+    scripts_path = f'{SAMPLE_DIR}/batch-{batch_n:02d}/scripts.json'
+    if not os.path.exists(scripts_path):
+        raise FileNotFoundError(f'scripts.json missing at {scripts_path}')
+    if not os.path.exists(PROGRESS_PATH):
+        raise FileNotFoundError(f'progress.json missing at {PROGRESS_PATH}')
+    progress = json.load(open(PROGRESS_PATH))
+    batch_entry = next((b for b in progress.get('batches', [])
+                        if b.get('batch') == batch_n), None)
+    if batch_entry is None:
+        raise ValueError(f'batch {batch_n} not in progress.json')
+
+    h = hashlib.sha256()
+    with open(scripts_path, 'rb') as f:
+        h.update(f.read())
+    h.update(b'|')
+    h.update(json.dumps(batch_entry, sort_keys=True).encode('utf-8'))
+    return h.hexdigest()
+
+
+def cmd_confirm_batch(args: argparse.Namespace) -> None:
+    """Write a content-bound preflight stamp after the user has OK'd this
+    specific batch. Replaces the bare `touch` of the empty stamp file.
+
+    The orchestrator (per /run-batch step 3) runs this AFTER surfacing the
+    cost preflight and getting an explicit "go" on this batch.
+    """
+    batch_n = args.batch
+    pad = f'{batch_n:02d}'
+    batch_dir = f'{SAMPLE_DIR}/batch-{pad}'
+    if not os.path.isdir(batch_dir):
+        sys.exit(f'batch dir {batch_dir} does not exist — run next-batch first.')
+
+    try:
+        batch_hash = _compute_batch_hash(batch_n)
+    except (FileNotFoundError, ValueError) as e:
+        sys.exit(f'cannot compute batch hash: {e}')
+
+    body = {
+        'batch': batch_n,
+        'batchHash': batch_hash,
+        'confirmedAt': _now(),
+        'confirmedBy': 'user',
+    }
+    stamp_path = f'{batch_dir}/.preflight-confirmed'
+    with open(stamp_path, 'w') as f:
+        json.dump(body, f, indent=2)
+        f.write('\n')
+
+    print(f'wrote {stamp_path}')
+    print(f'  batch:       {batch_n}')
+    print(f'  batchHash:   {batch_hash}')
+    print(f'  confirmedAt: {body["confirmedAt"]}')
+    print(f'  confirmedBy: {body["confirmedBy"]}')
+
+
+def _verify_stamp(batch_n: int, ttl_hours: float) -> tuple[int, str]:
+    """Return (exit_code, message). 0 = OK, 1 = blocked.
+
+    Pulled out of cmd_verify_stamp so the hook test suite can exercise the
+    logic without spawning subprocesses for every assertion.
+    """
+    pad = f'{batch_n:02d}'
+    stamp_path = f'{SAMPLE_DIR}/batch-{pad}/.preflight-confirmed'
+
+    if not os.path.exists(stamp_path):
+        return 1, (f'no stamp at {stamp_path}\n'
+                   f'  surface the cost preflight, get user OK, then:\n'
+                   f'    python3 tools/sample_matrix_run.py confirm-batch '
+                   f'--batch {batch_n}')
+
+    try:
+        with open(stamp_path) as f:
+            data = json.load(f)
+    except json.JSONDecodeError as e:
+        return 1, (f'stamp at {stamp_path} is not valid JSON ({e}).\n'
+                   f'  Legacy presence-only stamp? Re-confirm via:\n'
+                   f'    python3 tools/sample_matrix_run.py confirm-batch '
+                   f'--batch {batch_n}')
+
+    recorded_hash = data.get('batchHash')
+    if not recorded_hash:
+        return 1, (f'stamp at {stamp_path} has no batchHash field.\n'
+                   f'  Re-confirm via:\n'
+                   f'    python3 tools/sample_matrix_run.py confirm-batch '
+                   f'--batch {batch_n}')
+
+    try:
+        expected_hash = _compute_batch_hash(batch_n)
+    except (FileNotFoundError, ValueError) as e:
+        return 1, (f'cannot recompute batch hash: {e}\n'
+                   f'  Resolve the underlying state issue, then re-confirm.')
+
+    if recorded_hash != expected_hash:
+        return 1, (f'stamp content drift detected — confirmed state no longer '
+                   f'matches current state.\n'
+                   f'  expected: {expected_hash}\n'
+                   f'  recorded: {recorded_hash}\n'
+                   f'  scripts.json or progress[batch-{batch_n} entry] changed '
+                   f'since confirmation.\n'
+                   f'  Re-surface cost preflight, get fresh OK, then:\n'
+                   f'    python3 tools/sample_matrix_run.py confirm-batch '
+                   f'--batch {batch_n}')
+
+    if ttl_hours > 0:
+        confirmed_at = data.get('confirmedAt')
+        if confirmed_at:
+            try:
+                ts = time.strptime(confirmed_at, '%Y-%m-%dT%H:%M:%SZ')
+                age_hours = (time.time() - calendar.timegm(ts)) / 3600.0
+                if age_hours > ttl_hours:
+                    return 1, (f'stamp at {stamp_path} is older than '
+                               f'{ttl_hours:.1f}h '
+                               f'(confirmed at {confirmed_at}, age '
+                               f'{age_hours:.1f}h).\n'
+                               f'  Stale confirmation likely came from a prior '
+                               f'session. Re-confirm:\n'
+                               f'    python3 tools/sample_matrix_run.py '
+                               f'confirm-batch --batch {batch_n}')
+            except (ValueError, TypeError):
+                # Unparseable timestamp — treat as missing; don't block on this
+                # alone since hash already matched.
+                pass
+
+    return 0, f'stamp OK for batch {batch_n} (hash {expected_hash[:12]}…)'
+
+
+def cmd_verify_stamp(args: argparse.Namespace) -> None:
+    """Verify the preflight stamp for the named batch. Exits 0 if OK,
+    1 if blocked (with reason on stderr). Called by .claude/hooks/preflight_gate.sh.
+    """
+    ttl_env = os.environ.get('PREFLIGHT_TTL_HOURS')
+    if ttl_env is not None:
+        try:
+            ttl_hours = float(ttl_env)
+        except ValueError:
+            sys.stderr.write(
+                f'PREFLIGHT_TTL_HOURS={ttl_env!r} is not a number; '
+                f'falling back to default {DEFAULT_PREFLIGHT_TTL_HOURS}h.\n')
+            ttl_hours = DEFAULT_PREFLIGHT_TTL_HOURS
+    else:
+        ttl_hours = args.ttl_hours
+
+    code, message = _verify_stamp(args.batch, ttl_hours)
+    if code == 0:
+        if not args.quiet:
+            print(message)
+        sys.exit(0)
+    sys.stderr.write(message + '\n')
+    sys.exit(1)
+
+
 def cmd_inspect_batch(args: argparse.Namespace) -> None:
     """Show batch contents + dispatch progress in a compact form.
 
@@ -1862,6 +2060,29 @@ def main() -> None:
     p_agg.add_argument('--transcripts', help='Path to transcripts dir '
                                              '(default: runs/matrix-sampled/batch-NN/transcripts).')
     p_agg.set_defaults(func=cmd_aggregate_batch)
+
+    p_confirm = sub.add_parser('confirm-batch',
+                               help='Write a content-bound preflight stamp '
+                                    'after user OK. Replaces the bare touch '
+                                    'of an empty stamp file.')
+    p_confirm.add_argument('--batch', type=int, required=True)
+    p_confirm.set_defaults(func=cmd_confirm_batch)
+
+    p_verify_stamp = sub.add_parser('verify-stamp',
+                                    help='Verify the preflight stamp matches '
+                                         'current state (hash + TTL). Used by '
+                                         '.claude/hooks/preflight_gate.sh.')
+    p_verify_stamp.add_argument('--batch', type=int, required=True)
+    p_verify_stamp.add_argument('--ttl-hours', type=float,
+                                default=DEFAULT_PREFLIGHT_TTL_HOURS,
+                                help=f'Reject stamps older than this many '
+                                     f'hours (default: '
+                                     f'{DEFAULT_PREFLIGHT_TTL_HOURS}; set 0 to '
+                                     f'disable; env PREFLIGHT_TTL_HOURS '
+                                     f'overrides).')
+    p_verify_stamp.add_argument('--quiet', action='store_true',
+                                help='Suppress success message on stdout.')
+    p_verify_stamp.set_defaults(func=cmd_verify_stamp)
 
     p_inspect = sub.add_parser('inspect-batch',
                                help='Compact view of a batch + which cells '

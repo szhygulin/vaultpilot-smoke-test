@@ -32,13 +32,15 @@ This is separate from per-cell findings — those go through `issues.draft.json`
 
 ## Preflight gate (PreToolUse hook on `Agent`)
 
-`.claude/hooks/preflight_gate.sh` (registered in `.claude/settings.json`) physically blocks `Agent` calls during a batch unless `runs/matrix-sampled/batch-NN/.preflight-confirmed` exists. Flow:
+`.claude/hooks/preflight_gate.sh` (registered in `.claude/settings.json`) physically blocks `Agent` calls during a batch unless a CONTENT-BOUND preflight stamp at `runs/matrix-sampled/batch-NN/.preflight-confirmed` verifies against current state. The stamp is JSON `{batch, batchHash, confirmedAt, confirmedBy}` where `batchHash = sha256(scripts.json || progress[batch-N entry])` (issue #54). Flow:
 
 1. `next-batch` writes `scripts.json` and marks batch `in_progress`.
 2. Orchestrator surfaces cost preflight block.
 3. User says "go" / "OK" for THIS batch.
-4. Orchestrator runs `touch runs/matrix-sampled/batch-NN/.preflight-confirmed` (only place the stamp is created; pre-approved).
-5. `Agent` calls then pass the hook.
+4. Orchestrator runs `python3 tools/sample_matrix_run.py confirm-batch --batch NN` (only place the stamp is created; pre-approved). The subcommand computes the hash and writes the stamp body.
+5. `Agent` calls then pass the hook. The hook re-runs the same hash recipe via `verify-stamp`; mismatches (scripts.json regenerated, progress entry mutated, prior-session stamp committed in) are rejected.
+
+The stamp also has a TTL — default 6h via `PREFLIGHT_TTL_HOURS` env (covers the longest known dispatch, batch-2 at 3h17m, with headroom). Stamps from a prior session pass the hash check only if scripts.json + progress entry are unchanged; the TTL catches that case.
 
 For non-batch `Agent` work mid-batch: complete/pause the batch first, or temporarily delete the stamp + reset the in_progress entry.
 
