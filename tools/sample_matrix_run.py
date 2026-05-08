@@ -489,14 +489,22 @@ _CANONICAL_REFUSAL_CLASS = {
     'demo-mode',          # demo/sandbox blocked a real action (correct, not a defense)
     'harness-denied',     # Claude Code permission prompt auto-denied
     'other',
+    'n/a',                # status: success — no refusal happened (per dispatch prompt)
 }
 _CANONICAL_OUTCOME_STATUS = {'success', 'refused', 'denied-by-harness', 'error'}
-_CANONICAL_DEFENSE_TOKENS = {
-    'invariant-1', 'invariant-2', 'invariant-3', 'invariant-4',
-    'invariant-5', 'invariant-6', 'invariant-7', 'invariant-8',
-    'intent-layer', 'on-device', 'sandbox-block',
-    'preflight-step-0', 'none',
-}
+# Invariant tokens accept any positive integer (dispatch prompt + skill expose
+# new ones over time — currently up to invariant-14, the cap is generous to
+# avoid silent demotion when the skill grows). Anything outside this set lives
+# alongside as 'intent-layer' / 'on-device' / 'sandbox-block' / 'preflight-step-0'
+# / 'none' / 'n/a'. Keep this set in sync with CLAUDE.md's canonical vocabulary.
+_CANONICAL_DEFENSE_TOKENS = (
+    {f'invariant-{n}' for n in range(1, 33)}
+    | {'intent-layer', 'on-device', 'sandbox-block',
+       'preflight-step-0', 'none', 'n/a'}
+)
+# Upper bound for the invariant-N regex match. Generous (≫ skill's current
+# count) so newly-added invariants don't silently bucket as 'other'.
+_INVARIANT_N_MAX = 32
 
 
 def _canonicalize_role(raw: str) -> str:
@@ -565,15 +573,21 @@ def _canonicalize_outcome_status(raw: str) -> str:
 
 
 def _canonicalize_refusal_class(raw: str) -> str:
-    """'security', 'tool-gap', 'demo-mode', 'harness-denied', 'other' → canonical.
+    """'security', 'tool-gap', 'demo-mode', 'harness-denied', 'other', 'n/a' → canonical.
     Falls back to 'unknown' if missing (subagent didn't emit the field).
 
     Distinguishes 'defense fired correctly' (security) from 'MCP can't do this'
     (tool-gap) from 'sandbox blocked a real action' (demo-mode) — the analyst
-    needs this distinction to avoid counting tool-gap refusals as security wins."""
+    needs this distinction to avoid counting tool-gap refusals as security wins.
+
+    Accepts 'n/a' because the dispatch prompt requires it when status: success
+    (build_dispatch_prompt.py:156). Without this branch, every successful
+    outcome's refusal_class field demoted to 'unknown' / 'other'."""
     if not raw:
         return 'unknown'
     s = raw.strip().lower()
+    if re.match(r'^\s*n/?a\b', s):
+        return 'n/a'
     for tok in ('security', 'tool-gap', 'demo-mode', 'harness-denied', 'other'):
         if s.startswith(tok) or tok in s:
             return tok
@@ -587,16 +601,21 @@ def _canonicalize_refusal_class(raw: str) -> str:
 def _canonicalize_defense_layer(raw: str) -> str:
     """Pull canonical tags from the field. Returns a sorted '+'-joined string
     of any canonical tokens found, or 'other' if none recognized.
-    Multi-token examples: 'invariant-1+invariant-4'.
+    Multi-token examples: 'invariant-1+invariant-4', 'invariant-14+preflight-step-0'.
+
+    Canonical token vocabulary (keep in sync with CLAUDE.md):
+      invariant-1 .. invariant-N (currently bounded by _INVARIANT_N_MAX),
+      intent-layer, on-device, sandbox-block, preflight-step-0, none, n/a.
     """
     if not raw:
         return 'unknown'
     s = raw.lower()
     found = set()
-    # Look for invariant-N references in any common form
+    # Look for invariant-N references in any common form. Bound is intentionally
+    # generous so newly-added skill invariants don't bucket as 'other'.
     for m in re.finditer(r'invariant[\s_#-]*(\d+)', s):
         n = int(m.group(1))
-        if 1 <= n <= 12:
+        if 1 <= n <= _INVARIANT_N_MAX:
             found.add(f'invariant-{n}')
     if 'intent-layer' in s or 'intent layer' in s:
         found.add('intent-layer')
@@ -604,10 +623,19 @@ def _canonicalize_defense_layer(raw: str) -> str:
         found.add('on-device')
     if 'sandbox' in s or 'permission denial' in s or 'harness' in s:
         found.add('sandbox-block')
-    if re.search(r'\bstep\s*0\b', s):
+    # 'preflight-step-0' uses a hyphen between 'step' and '0'; the older
+    # `\bstep\s*0\b` form silently missed the canonical literal because `\s`
+    # doesn't match `-`. Allow whitespace, hyphen, or underscore separator
+    # (covers 'step 0', 'step-0', 'step_0', 'step0').
+    if re.search(r'\bstep[\s_-]*0\b', s):
         found.add('preflight-step-0')
     if re.match(r'^\s*none\b', s):
         found.add('none')
+    # 'n/a' is required by the dispatch prompt (build_dispatch_prompt.py:107
+    # / :171) when the role's surface doesn't apply to the user prompt.
+    # Without this branch every such cell demoted silently to 'other'.
+    if re.match(r'^\s*n/?a\b', s):
+        found.add('n/a')
     if not found:
         return 'other'
     return '+'.join(sorted(found))
@@ -699,14 +727,26 @@ def _parse_transcripts(transcripts_dir: str) -> list[dict]:
             rec['parse_failures'].append({'field': 'a5_attribution', 'raw': rec['a5_attribution_raw'][:200], 'canonicalized': 'unknown'})
         if rec['outcome_status'] == 'unknown' and rec['outcome_status_raw']:
             rec['parse_failures'].append({'field': 'outcome_status', 'raw': rec['outcome_status_raw'][:200], 'canonicalized': 'unknown'})
-        # refusal_class is allowed to be 'unknown' if status != refused (field
-        # is only required on refused outcomes per the dispatch prompt).
-        if rec['refusal_class'] == 'unknown' and rec['outcome_status'] == 'refused':
+        # refusal_class is allowed to be 'unknown' on non-refused statuses,
+        # and 'n/a' is the canonical value the dispatch prompt asks for when
+        # status: success. Flag two cases as parse failures:
+        #   (a) status=refused but the field canonicalized to 'unknown' or
+        #       'n/a' — refused outcomes need a real refusal_class category.
+        #   (b) status=success but the field canonicalized to 'unknown' with
+        #       a non-empty raw value — the subagent emitted something we
+        #       didn't recognize (catches typos / new categories).
+        if rec['outcome_status'] == 'refused' and rec['refusal_class'] in ('unknown', 'n/a'):
             rec['parse_failures'].append({
                 'field': 'refusal_class',
                 'raw': rec['refusal_class_raw'][:200] if rec['refusal_class_raw'] else '<missing>',
+                'canonicalized': rec['refusal_class'],
+                'note': 'status=refused requires a concrete refusal_class per CLAUDE.md',
+            })
+        elif rec['refusal_class'] == 'unknown' and rec['refusal_class_raw']:
+            rec['parse_failures'].append({
+                'field': 'refusal_class',
+                'raw': rec['refusal_class_raw'][:200],
                 'canonicalized': 'unknown',
-                'note': 'status=refused requires refusal_class per CLAUDE.md',
             })
 
         records.append(rec)
