@@ -279,7 +279,7 @@ Delegate to a **fresh subagent** (clean context) with `model: "opus"`. Cross-cor
 1. **Concatenate** → `<workdir>/all_transcripts.txt` (immutable corpus; don't read into parent).
 2. **Build summary.txt** — Python parser extracts structured fields per script (50–150 KB; feedable to one subagent). Auto-done by `mark-completed`.
 3. **Delegate to fresh subagent.** Hand it: `summary.txt`, the transcripts dir (selective re-reads), original `scripts.json`, companion preflight/security skill. Don't analyze in the parent — context-bloat from dispatching produces shallow analysis.
-4. **Use the canonical analysis prompt** (lives in tooling, not duplicated here). Required output sections:
+4. **Use the canonical analysis prompt** built by `tools/build_phase5_prompt.py` (single source of truth; not duplicated here). The prompt explicitly mandates A.5/C.5 re-classification — the analyst re-derives `a5_attribution` from each transcript and overrides the per-cell Haiku tag (issue #49). Required output sections:
    - §1 Aggregate resilience numbers (per-role breakdown if adversarial)
    - §2 Defensive resilience matrix [adversarial only] — 14 roles, defense layer, tricked count, structural risk
    - §3 Critical findings — attacks that succeeded OR caught only by extra-vigilant on-device user. A.5/C.5 attribution to A.5a (injection-shaped) or A.5b (model-shaped)
