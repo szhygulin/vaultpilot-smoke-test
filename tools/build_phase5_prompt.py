@@ -25,6 +25,8 @@ Usage:
   python3 tools/build_phase5_prompt.py --batch N --prior-batches 1,2,3
   python3 tools/build_phase5_prompt.py --batch N --mcp-name vaultpilot-mcp
 """
+from __future__ import annotations
+
 import argparse
 import sys
 from pathlib import Path

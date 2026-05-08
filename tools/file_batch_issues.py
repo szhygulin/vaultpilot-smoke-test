@@ -97,6 +97,8 @@ Pre-reqs:
 - Labels referenced in `issues.draft.json` must exist on the repo (or be
   pre-created via `gh label create`); the script does not auto-create.
 """
+from __future__ import annotations
+
 import argparse
 import json
 import os
