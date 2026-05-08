@@ -16,7 +16,7 @@ All smoke-test artifacts (`scripts.json`, `transcripts/`, `summary.txt`, `aggreg
 Every instruction in the *Smoke-test methodology* section below is **mandatory**:
 
 - **Phase 2.5 cost preflight is a hard gate, fires on every batch.** A "go" on batch N does NOT authorize batch N+1. Running `next-batch` prints the block as a side effect — printing is not confirming. Pause for explicit user OK before any `Agent` dispatch.
-- **Use the pre-approved helper subcommands** (`inspect-batch`, `verify-transcripts`, `mark-completed`, `aggregate-batch`, `next-batch`, `status`) instead of ad-hoc `python3 -c "..."`.
+- **Use the pre-approved helper subcommands** (`inspect-batch`, `verify-transcripts`, `mark-completed`, `aggregate-batch`, `next-batch`, `status`, `enable-calibration`) instead of ad-hoc `python3 -c "..."`.
 - **Don't skip steps** in the 6-phase pipeline (Catalog → Generate → Cost preflight → Spawn → Concat → Analyze → File).
 - **Scope is UX + correctness + security.** Typosquat URLs, hallucinated addresses, sycophantic capitulations, wrong explanations, confusing prose are all findings.
 - **All findings go to `issues.draft.json` with `attribution`; user picks exclusions at GATE 2.** Never silently drop a finding. Advisory (A.5/C.5) findings still appear in the draft — but the filer routes them by attribution: `mcp-defect` → `--repo`, `skill-defect` → `--skill-repo`, `advisory-*` → `--advisory-repo` (default: NOT filed; written to `runs/matrix-sampled/batch-NN/advisory-upstream.md` instead). Pure-prose findings with no signing-flow traversal MUST attribute as `advisory-*` so they don't end up filed against `vaultpilot-mcp` (per [#52](https://github.com/szhygulin/vaultpilot-mcp-smoke-test/issues/52); see Phase 5 §6 traversal-test rule below).

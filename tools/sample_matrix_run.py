@@ -96,6 +96,40 @@ DEFAULT_BATCH_SESSION_FRACTION = 0.25   # batch fills this much of one 5-hour se
                                         # to give smaller, faster-to-analyze
                                         # batches against the 9020-cell matrix)
 DEFAULT_SEED = 42
+DEFAULT_CALIBRATION_FRACTION = 0.0      # off by default (backward compat); recommended 0.05 (issue #48).
+                                        # When > 0: next-batch flags ceil(fraction * batch_size) cells (min 1)
+                                        # for re-dispatch on a stronger model. Cost preflight prices the rerun
+                                        # against per_cell tokens because Sonnet/Opus DO deplete the
+                                        # all-models weekly bucket (unlike the Haiku main pass).
+DEFAULT_CALIBRATION_MODEL = 'sonnet'    # advisory label only; orchestrator picks the actual model.
+                                        # Recorded in partition.json for traceability + cost preflight wording.
+
+# Fields compared between main (Haiku) and calibration (Sonnet/Opus) transcripts.
+# Disagreement on ANY of these is a methodology-review trigger per issue #48.
+_CALIBRATION_DIFF_FIELDS = (
+    'outcome_status',
+    'role',
+    'defense_layer',
+    'did_user_get_tricked',
+    'a5_attribution',
+)
+
+
+def _select_calibration_ids(cell_ids: list[str], fraction: float,
+                            seed: int, batch_n: int) -> set[str]:
+    """Deterministically pick ceil(fraction * len(cell_ids)) calibration cell ids.
+
+    Per-batch sub-seed (seed << 16) | batch_n keeps batch-N's selection stable
+    across runs and independent of other batches' sizes — matters because
+    next-batch is invoked per-batch, not all-at-once.
+    """
+    if fraction <= 0 or not cell_ids:
+        return set()
+    n = max(1, int(round(fraction * len(cell_ids))))
+    n = min(n, len(cell_ids))
+    sorted_ids = sorted(cell_ids)
+    rnd = random.Random((seed << 16) | batch_n)
+    return set(rnd.sample(sorted_ids, n))
 
 
 def _now() -> str:
@@ -212,6 +246,8 @@ def cmd_init(args: argparse.Namespace) -> None:
             'tokens_per_cell': args.per_cell,
             'analysis_tokens': args.analysis_tokens,
             'batch_session_fraction': DEFAULT_BATCH_SESSION_FRACTION,
+            'calibration_fraction': args.calibration_fraction,
+            'calibration_model': args.calibration_model,
         },
         'total_cells': len(cells),
         'total_batches': len(batches),
@@ -259,6 +295,15 @@ def cmd_init(args: argparse.Namespace) -> None:
     print(f"  All-models session:  ~{pct_batch_session:.1f}% of bucket "
           f"(~{analysis_tokens / 1e6:.2f}M / anchor ~{args.session_all_models / 1e6:.0f}M)")
     print(f"  seed: {partition['seed']}")
+    if args.calibration_fraction > 0:
+        # Per-batch calibration cells × per_cell on the calibration model — DOES
+        # deplete all-models weekly. Estimate uses one batch as a reference
+        # (each batch is independently calibrated; cumulative cost = N batches).
+        calib_cells_per_batch = max(1, int(round(args.calibration_fraction * batch_size)))
+        calib_throughput = calib_cells_per_batch * args.per_cell
+        print(f"  calibration:        ~{args.calibration_fraction * 100:.1f}% of each batch "
+              f"= {calib_cells_per_batch} cells/batch on {args.calibration_model} "
+              f"(~{calib_throughput / 1e6:.2f}M tokens/batch — depletes all-models weekly)")
     print()
     print(f"Anchors are placeholders — verify against your account dashboard "
           f"and override via init flags if they don't match.")
@@ -384,17 +429,41 @@ def cmd_next_batch(args: argparse.Namespace) -> None:
     os.makedirs(f'{batch_dir}/transcripts', exist_ok=True)
     scripts_path = f'{batch_dir}/scripts.json'
 
+    # Calibration tagging (issue #48): deterministically pick ~fraction% of
+    # this batch's cells for re-dispatch on a stronger model. Per-batch sub-seed
+    # keeps the selection stable across re-runs of next-batch on the same batch.
+    bc = partition['budget_constraint']
+    calib_fraction = bc.get('calibration_fraction', DEFAULT_CALIBRATION_FRACTION)
+    calib_model = bc.get('calibration_model', DEFAULT_CALIBRATION_MODEL)
+    calib_ids = _select_calibration_ids(
+        cell_ids=[c['id'] for c in hydrated],
+        fraction=calib_fraction,
+        seed=partition.get('seed', DEFAULT_SEED),
+        batch_n=batch_n,
+    )
+    for c in hydrated:
+        c['calibrate'] = c['id'] in calib_ids
+    if calib_ids:
+        # Pre-create transcripts/calibration/ so the calibration dispatch pass
+        # has somewhere to write. Same rationale as transcripts/ above.
+        os.makedirs(f'{batch_dir}/transcripts/calibration', exist_ok=True)
+
     out = {
         '_comment': (
             f'Batch {batch_n} of {progress["total_batches"]} — '
             f'{len(hydrated)} cells ({len(canaries)} canaries + '
             f'{len(hydrated) - len(canaries)} matrix-sampled). '
             'Dispatch all of them concurrently via skill/SKILL.md Phase 3.'
+            + (f' {len(calib_ids)} cell(s) tagged calibrate=true; after the '
+               f'main pass, re-dispatch those on {calib_model} into '
+               f'transcripts/calibration/.' if calib_ids else '')
         ),
         'batch': batch_n,
         'addressBook': matrix.get('addressBook', {}),
         'roleLegend': matrix.get('roleLegend', {}),
         'canary_count': len(canaries),
+        'calibration_model': calib_model if calib_ids else None,
+        'calibration_cell_ids': sorted(calib_ids),
         'scripts': hydrated,
     }
     with open(scripts_path, 'w') as f:
@@ -413,7 +482,6 @@ def cmd_next_batch(args: argparse.Namespace) -> None:
     out_of_scope = role_counts.get('A.5', 0) + role_counts.get('C.5', 0)
     control = role_counts.get('E', 0)
 
-    bc = partition['budget_constraint']
     per_cell = bc['tokens_per_cell']
     all_models_weekly = bc.get('all_models_weekly_tokens', DEFAULT_ALL_MODELS_WEEKLY)
     session_all_models = bc.get('session_all_models_tokens', DEFAULT_SESSION_ALL_MODELS)
@@ -422,6 +490,12 @@ def cmd_next_batch(args: argparse.Namespace) -> None:
     dispatch_throughput = len(hydrated) * per_cell      # Haiku — quota-free
     pct_batch_all = analysis_tokens / all_models_weekly * 100
     pct_batch_session = analysis_tokens / session_all_models * 100
+
+    # Calibration (issue #48): N cells re-run on calibration model. Sonnet/Opus
+    # DO deplete all-models — price the rerun at per_cell tokens × N.
+    calib_throughput = len(calib_ids) * per_cell
+    pct_calib_all = (calib_throughput / all_models_weekly * 100) if all_models_weekly else 0
+    pct_calib_session = (calib_throughput / session_all_models * 100) if session_all_models else 0
 
     total_batches = progress['total_batches']
     batches_done = sum(1 for b in progress['batches']
@@ -449,8 +523,15 @@ def cmd_next_batch(args: argparse.Namespace) -> None:
     if control:
         print(f"            ℹ {control} E cells are control (everyone honest); "
               f"any defense_layer firing on these is a false-positive finding.")
+    if calib_ids:
+        print(f"            ℹ {len(calib_ids)} cell(s) tagged calibrate=true "
+              f"(re-dispatch on {calib_model} after the main pass; "
+              f"transcripts → batch-{batch_n:02d}/transcripts/calibration/).")
     print(f"Throughput: ~{dispatch_throughput / 1e6:.2f}M Haiku tokens "
           f"(dispatch — quota-free)")
+    if calib_ids:
+        print(f"            ~{calib_throughput / 1e6:.2f}M {calib_model} tokens "
+              f"(calibration re-dispatch — DEPLETES all-models bucket)")
     print(f"            ~{analysis_tokens / 1e6:.2f}M Opus tokens "
           f"(Phase 5 analysis subagent — hits all-models bucket)")
     print(f"Progress:   {batches_done} / {total_batches} batches done")
@@ -460,6 +541,11 @@ def cmd_next_batch(args: argparse.Namespace) -> None:
           f"(~{analysis_tokens / 1e6:.2f}M / anchor ~{all_models_weekly / 1e6:.0f}M)")
     print(f"  All-models session:  ~{pct_batch_session:.1f}% of bucket "
           f"(~{analysis_tokens / 1e6:.2f}M / anchor ~{session_all_models / 1e6:.0f}M)")
+    if calib_ids:
+        print(f"  Calibration weekly:  ~{pct_calib_all:.2f}% of bucket "
+              f"(~{calib_throughput / 1e6:.2f}M / anchor ~{all_models_weekly / 1e6:.0f}M)")
+        print(f"  Calibration session: ~{pct_calib_session:.1f}% of bucket "
+              f"(~{calib_throughput / 1e6:.2f}M / anchor ~{session_all_models / 1e6:.0f}M)")
     print()
     print(f"Anchors are placeholders — verify against your account dashboard "
           f"and override via `init --all-models-weekly`, `--session-all-models`, "
@@ -831,6 +917,139 @@ def _validate_canary(rec: dict, expected: dict) -> dict:
     }
 
 
+def _record_id(rec: dict) -> str:
+    """script_id is the canonical join key; fall back to filename basename."""
+    return rec.get('script_id') or rec['file'].replace('.txt', '')
+
+
+def _aggregate_calibration(batch_n: int, batch_dir: str,
+                           main_records: list[dict],
+                           calib_dir: str) -> dict | None:
+    """Parse calibration transcripts, diff against main records on the
+    canonicalized fields, write batch-NN/calibration.json. Returns the
+    dict written, or None if no calibration transcripts present.
+
+    Why this exists (issue #48): the main pass runs on Haiku for cost; without
+    a stronger-model spot-check we can't tell whether `defense_layer: none`
+    on a row means the attack was correctly absent or that Haiku missed it.
+    Disagreement on any of _CALIBRATION_DIFF_FIELDS = methodology-review trigger.
+    """
+    if not os.path.isdir(calib_dir):
+        return None
+    calib_records = _parse_transcripts(calib_dir)
+    if not calib_records:
+        return None
+
+    main_by_id = {_record_id(r): r for r in main_records}
+
+    per_cell_diffs = []
+    field_counts = {f: {'agree': 0, 'disagree': 0, 'missing_main': 0}
+                    for f in _CALIBRATION_DIFF_FIELDS}
+    any_disagree = 0
+    matched_ids: set[str] = set()
+    orphan_calib_ids: list[str] = []
+
+    for cr in calib_records:
+        cid = _record_id(cr)
+        mr = main_by_id.get(cid)
+        if mr is None:
+            orphan_calib_ids.append(cid)
+            continue
+        matched_ids.add(cid)
+        diffs = []
+        cell = {
+            'script_id': cid,
+            'main': {f: mr.get(f) for f in _CALIBRATION_DIFF_FIELDS},
+            'calibration': {f: cr.get(f) for f in _CALIBRATION_DIFF_FIELDS},
+            'disagreements': diffs,
+        }
+        for f in _CALIBRATION_DIFF_FIELDS:
+            mv, cv = mr.get(f), cr.get(f)
+            if mv == cv:
+                field_counts[f]['agree'] += 1
+            else:
+                field_counts[f]['disagree'] += 1
+                diffs.append(f)
+        if diffs:
+            any_disagree += 1
+        per_cell_diffs.append(cell)
+
+    # Missing calibration transcripts: cells the orchestrator should have
+    # re-dispatched (per scripts.json#calibration_cell_ids) but didn't.
+    scripts_path = f'{batch_dir}/scripts.json'
+    expected_calib_ids: list[str] = []
+    calib_model_label = DEFAULT_CALIBRATION_MODEL
+    if os.path.exists(scripts_path):
+        try:
+            scripts_doc = json.load(open(scripts_path))
+            expected_calib_ids = list(scripts_doc.get('calibration_cell_ids') or [])
+            calib_model_label = (scripts_doc.get('calibration_model')
+                                 or DEFAULT_CALIBRATION_MODEL)
+        except (json.JSONDecodeError, OSError):
+            pass
+    missing_calib_ids = [cid for cid in expected_calib_ids
+                         if cid not in matched_ids and cid not in orphan_calib_ids]
+
+    matched = len(matched_ids)
+    rate = (any_disagree / matched) if matched else None
+
+    out = {
+        'batch': batch_n,
+        'main_model': 'haiku',
+        'calibration_model': calib_model_label,
+        'expected_calibration_cells': len(expected_calib_ids),
+        'calibration_transcripts_found': len(calib_records),
+        'matched_cells': matched,
+        'orphan_calibration_ids': orphan_calib_ids,
+        'missing_calibration_ids': missing_calib_ids,
+        'agreement_by_field': field_counts,
+        'any_field_disagreement_count': any_disagree,
+        'any_field_disagreement_rate': rate,
+        'per_cell_diffs': per_cell_diffs,
+    }
+    out_path = f'{batch_dir}/calibration.json'
+    with open(out_path, 'w') as f:
+        json.dump(out, f, indent=2)
+    return out
+
+
+def _format_calibration_summary_lines(calib: dict) -> list[str]:
+    """Compact human-readable header for summary.txt §0 / findings.md §1."""
+    lines = []
+    lines.append('=== CALIBRATION (issue #48) ===')
+    rate = calib.get('any_field_disagreement_rate')
+    rate_str = f"{rate * 100:.1f}%" if rate is not None else 'n/a'
+    lines.append(
+        f"matched={calib['matched_cells']}/{calib['expected_calibration_cells']} "
+        f"calibration cells; any-field disagreement: "
+        f"{calib['any_field_disagreement_count']}/{calib['matched_cells']} "
+        f"({rate_str})"
+    )
+    if calib.get('missing_calibration_ids'):
+        lines.append(
+            f"⚠ {len(calib['missing_calibration_ids'])} expected calibration "
+            f"transcripts missing — orchestrator must re-dispatch on "
+            f"{calib.get('calibration_model', 'calibration model')}: "
+            f"{calib['missing_calibration_ids'][:5]}"
+            f"{'...' if len(calib['missing_calibration_ids']) > 5 else ''}"
+        )
+    if calib.get('orphan_calibration_ids'):
+        lines.append(
+            f"⚠ {len(calib['orphan_calibration_ids'])} calibration transcripts "
+            f"have no matching main transcript — likely cell-id drift: "
+            f"{calib['orphan_calibration_ids'][:5]}"
+        )
+    for f, c in calib['agreement_by_field'].items():
+        total = c['agree'] + c['disagree']
+        if total == 0:
+            continue
+        pct = c['disagree'] / total * 100
+        marker = '⚠ ' if pct >= 20 else '  '
+        lines.append(f"{marker}{f}: {c['disagree']}/{total} disagree ({pct:.0f}%)")
+    lines.append('')
+    return lines
+
+
 def _aggregate_batch(batch_n: int, transcripts_dir: str | None = None,
                     quiet: bool = False) -> dict | None:
     """Run the quick aggregate over a batch's transcripts. Writes
@@ -898,9 +1117,21 @@ def _aggregate_batch(batch_n: int, transcripts_dir: str | None = None,
     canary_drift_count = sum(1 for cr in canary_results if cr['drifted'])
     drifted_canaries = [cr for cr in canary_results if cr['drifted']]
 
-    # Write summary.txt with the CANARY DRIFT block at the top (if any drift).
+    # Calibration diff (issue #48): if calibration transcripts exist, parse
+    # them and write batch-NN/calibration.json. Diff is computed against the
+    # MATRIX records — calibration is a Haiku-vs-stronger-model spot-check on
+    # the matrix-sampled signal, not on canaries (which have ground-truth
+    # expectations of their own).
+    calib_dir = f'{batch_dir}/transcripts/calibration'
+    calibration = _aggregate_calibration(batch_n, batch_dir, matrix_records, calib_dir)
+
+    # Write summary.txt: calibration header (if present) → CANARY block (if
+    # any results) → canary transcripts → matrix transcripts.
     summary_path = f'{batch_dir}/summary.txt'
     with open(summary_path, 'w') as o:
+        if calibration is not None:
+            for line in _format_calibration_summary_lines(calibration):
+                o.write(line + '\n')
         if canary_drift_count > 0:
             o.write("=" * 64 + "\n")
             o.write(f"CANARY DRIFT — {canary_drift_count} of {len(canary_results)} "
@@ -1001,6 +1232,14 @@ def _aggregate_batch(batch_n: int, transcripts_dir: str | None = None,
         'canary_results': canary_results,
         'canary_drift_count': canary_drift_count,
         'canary_drifted_ids': [cr['id'] for cr in drifted_canaries],
+        'calibration': {
+            'present': calibration is not None,
+            'matched_cells': calibration['matched_cells'] if calibration else 0,
+            'any_field_disagreement_count':
+                calibration['any_field_disagreement_count'] if calibration else 0,
+            'any_field_disagreement_rate':
+                calibration['any_field_disagreement_rate'] if calibration else None,
+        },
     }
     aggregate_path = f'{batch_dir}/aggregate.json'
     with open(aggregate_path, 'w') as f:
@@ -1047,6 +1286,17 @@ def _aggregate_batch(batch_n: int, transcripts_dir: str | None = None,
             print(f"  ⚠ {tricked} transcripts where user got tricked: "
                   f"{aggregate['tricked_script_ids'][:5]}"
                   f"{'...' if tricked > 5 else ''}")
+        if calibration is not None:
+            rate = calibration.get('any_field_disagreement_rate')
+            rate_str = f"{rate * 100:.1f}%" if rate is not None else 'n/a'
+            print(f"  calibration:          "
+                  f"{calibration['matched_cells']} matched cells, "
+                  f"{calibration['any_field_disagreement_count']} disagree "
+                  f"({rate_str}); see calibration.json")
+            if calibration.get('missing_calibration_ids'):
+                print(f"  ⚠ {len(calibration['missing_calibration_ids'])} expected "
+                      f"calibration transcripts missing — re-dispatch on "
+                      f"{calibration.get('calibration_model', 'calibration model')}")
         if all_parse_failures:
             # Lane 1: never silently skip a parse failure. Surface count + the
             # first 5 entries so the orchestrator and analyst both see them.
@@ -1348,12 +1598,31 @@ def cmd_inspect_batch(args: argparse.Namespace) -> None:
         sys.exit(f"Batch {args.batch} not in partition (have batches "
                  f"1..{partition['total_batches']}).")
 
-    transcripts_dir = f'{SAMPLE_DIR}/batch-{args.batch:02d}/transcripts'
+    batch_dir = f'{SAMPLE_DIR}/batch-{args.batch:02d}'
+    transcripts_dir = f'{batch_dir}/transcripts'
     done_ids = set()
     if os.path.isdir(transcripts_dir):
         done_ids = {fn.replace('.txt', '')
                     for fn in os.listdir(transcripts_dir)
                     if fn.endswith('.txt')}
+
+    # Calibration state (issue #48): scripts.json carries calibration_cell_ids
+    # (only set when partition's calibration_fraction > 0). Calibration
+    # transcripts live under transcripts/calibration/.
+    calib_dir = f'{transcripts_dir}/calibration'
+    calib_done_ids = set()
+    if os.path.isdir(calib_dir):
+        calib_done_ids = {fn.replace('.txt', '')
+                          for fn in os.listdir(calib_dir)
+                          if fn.endswith('.txt')}
+    calib_expected_ids: list[str] = []
+    scripts_path = f'{batch_dir}/scripts.json'
+    if os.path.exists(scripts_path):
+        try:
+            scripts_doc = json.load(open(scripts_path))
+            calib_expected_ids = list(scripts_doc.get('calibration_cell_ids') or [])
+        except (json.JSONDecodeError, OSError):
+            pass
 
     pending = []
     role_counts: dict[str, int] = {}
@@ -1383,6 +1652,18 @@ def cmd_inspect_batch(args: argparse.Namespace) -> None:
               f"§7 upstream-escalation in findings.md (NOT issues.draft.json)")
     if control:
         print(f"  ℹ {control} E (control) cells (any defense firing → false-positive)")
+    if calib_expected_ids:
+        calib_pending = [cid for cid in calib_expected_ids
+                         if cid not in calib_done_ids]
+        print(f"  ℹ calibration: {len(calib_expected_ids)} cell(s) tagged; "
+              f"{len(calib_done_ids)} done, {len(calib_pending)} pending "
+              f"(re-dispatch on stronger model → "
+              f"transcripts/calibration/<id>.txt)")
+        if calib_pending:
+            for cid in calib_pending[:10]:
+                print(f"    - {cid}")
+            if len(calib_pending) > 10:
+                print(f"    ... and {len(calib_pending) - 10} more")
     if not pending:
         print("\nAll cells transcribed. Next: `mark-completed --batch "
               f"{args.batch}` to auto-aggregate + Phase 5.")
@@ -1459,6 +1740,35 @@ def cmd_verify_transcripts(args: argparse.Namespace) -> None:
         sys.exit(1)
 
 
+def cmd_enable_calibration(args: argparse.Namespace) -> None:
+    """Retrofit calibration_fraction onto an existing partition without
+    reshuffling. Use this when you want to enable issue-#48 calibration on
+    an in-progress matrix run; re-init would lose batch progress.
+
+    Calibration cell selection is computed at next-batch time per-batch
+    (deterministic via per-batch sub-seed), so completed batches are
+    untouched and any future batch will be re-tagged on dispatch.
+    """
+    if not os.path.exists(PARTITION_PATH):
+        sys.exit("No partition yet. Run `init` first.")
+    partition = json.load(open(PARTITION_PATH))
+    bc = partition.setdefault('budget_constraint', {})
+    old_fraction = bc.get('calibration_fraction', 0.0)
+    old_model = bc.get('calibration_model', DEFAULT_CALIBRATION_MODEL)
+    bc['calibration_fraction'] = args.fraction
+    bc['calibration_model'] = args.model
+    with open(PARTITION_PATH, 'w') as f:
+        json.dump(partition, f, indent=2)
+    print(f"updated {PARTITION_PATH}")
+    print(f"  calibration_fraction: {old_fraction} → {args.fraction}")
+    print(f"  calibration_model:    {old_model} → {args.model}")
+    if args.fraction > 0:
+        approx = max(1, int(round(args.fraction * partition['batch_size'])))
+        print(f"  next-batch will tag ~{approx} cell(s)/batch as calibrate=true")
+    print("  (completed batches are untouched; in_progress / pending batches "
+          "get tagged at next-batch time)")
+
+
 def cmd_status(args: argparse.Namespace) -> None:
     if not os.path.exists(PROGRESS_PATH):
         sys.exit("No partition yet. Run `init` first.")
@@ -1504,9 +1814,29 @@ def main() -> None:
                         type=int, default=None,
                         help='Concurrent subagents per batch '
                              '(default: auto-derive to fill ~50%% of session anchor)')
+    p_init.add_argument('--calibration-fraction', dest='calibration_fraction',
+                        type=float, default=DEFAULT_CALIBRATION_FRACTION,
+                        help='Fraction of each batch to re-dispatch on a stronger '
+                             'model for Haiku-vs-Sonnet calibration (issue #48). '
+                             'Default 0.0 (off); recommended 0.05.')
+    p_init.add_argument('--calibration-model', dest='calibration_model',
+                        default=DEFAULT_CALIBRATION_MODEL,
+                        help='Advisory label for the calibration model '
+                             '(default: sonnet). Orchestrator picks the actual '
+                             'model at dispatch time.')
     p_init.add_argument('--force', action='store_true',
                         help='Overwrite existing partition.json + progress.json')
     p_init.set_defaults(func=cmd_init)
+
+    p_calib = sub.add_parser(
+        'enable-calibration',
+        help='Retrofit calibration_fraction onto an existing partition '
+             '(no reshuffle, preserves batch progress).')
+    p_calib.add_argument('--fraction', type=float, required=True,
+                         help='New calibration_fraction (0.0 disables; 0.05 typical).')
+    p_calib.add_argument('--model', default=DEFAULT_CALIBRATION_MODEL,
+                         help=f'Calibration model label (default: {DEFAULT_CALIBRATION_MODEL}).')
+    p_calib.set_defaults(func=cmd_enable_calibration)
 
     p_next = sub.add_parser('next-batch',
                             help='Print and persist next pending batch.')
