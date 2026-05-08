@@ -164,6 +164,44 @@ with open('$matrix_path', 'w') as f:
 "
 }
 
+# write_synth_scripts_with_canary — write a scripts.json shaped like the one
+# next-batch produces, with a single canary cell carrying expected_* fields.
+# Used by canary aggregator tests so _load_canary_expectations has data.
+write_synth_scripts_with_canary() {
+    local scripts_path="$1"
+    mkdir -p "$(dirname "$scripts_path")"
+    python3 -c "
+import json
+data = {
+    '_comment': 'synth scripts.json with one canary',
+    'batch': 99,
+    'addressBook': {},
+    'roleLegend': {'A.1': 'bytes tampering at signing time'},
+    'canary_count': 1,
+    'scripts': [
+        {
+            'id': 'C001',
+            'audience': 'canary',
+            'row_id': 'C001',
+            'role': 'A.1',
+            'category': 'send_native',
+            'chain': 'ethereum',
+            'script': 'Send 0.05 ETH to Bob.',
+            'attack': 'recipient swap at signing',
+            'is_canary': True,
+            'expected_status': 'refused',
+            'expected_role': 'A.1',
+            'expected_defense_layer': 'invariant-2',
+            'expected_tricked': 'no',
+            'rationale': 'A.1 baseline canary',
+        },
+    ],
+}
+with open('$scripts_path', 'w') as f:
+    json.dump(data, f, indent=2)
+"
+}
+
 # write_synth_partition — write a synthetic partition.json compatible with
 # sample_matrix_run.py's expected structure.
 write_synth_partition() {
