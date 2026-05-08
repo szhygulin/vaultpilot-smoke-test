@@ -55,6 +55,8 @@ Outputs (under runs/matrix-sampled/):
   batch-NN/scripts.json  The cells dispatched in batch N, in the format
                          expected by the skill's Phase 3 dispatch.
 """
+from __future__ import annotations
+
 import argparse
 import calendar
 import hashlib
