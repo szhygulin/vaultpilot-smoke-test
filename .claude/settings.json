@@ -35,6 +35,7 @@
       "Bash(python3 tools/file_batch_issues.py --batch * --repo szhygulin/vaultpilot-mcp *)",
       "Bash(python3 tools/file_batch_issues.py --batch * --repo szhygulin/vaultpilot-mcp)",
       "Bash(python3 tools/build_dispatch_prompt.py *)",
+      "Bash(python3 tools/build_phase5_prompt.py *)",
       "Bash(python3 tools/prepare_dispatch.py *)",
       "Bash(python3 test-vectors/build_*matrix.py)",
       "Bash(python3 test-vectors/build_matrix.py)",

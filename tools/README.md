@@ -11,6 +11,7 @@ Helper scripts used during smoke-test runs. These are the little utilities the p
 | `wait_for_transcripts.sh` | Block until a target transcript count is reached. Designed for `Bash(run_in_background:true)` so the parent agent gets a single "all done" notification | Phase 3 / 4 transition |
 | `sample_matrix_run.py` | Partition the (expert + newcomer) matrix into fixed-size random batches; track per-batch progress so every cell runs exactly once. User decides how many batches to dispatch per session/week. | Phase 2.5 (cost preflight) for matrix-mode runs |
 | `file_batch_issues.py` | Parse a batch's `issues.draft.json` (produced by the Phase 5 analysis subagent), file each as a GitHub issue via `gh issue create`, and append URLs to `issues.md`. Avoids the orchestrator re-constructing 10 issue heredocs inline per batch. | Phase 3.7 (issue filing) for matrix-mode runs |
+| `build_phase5_prompt.py` | Single source-of-truth for the canonical Phase 5 analysis prompt. Emits the prompt to stdout, ready to embed in the Opus analyst's `Agent` tool_use block. The prompt mandates A.5/C.5 re-classification (issue #49) — the analyst re-derives `a5_attribution` per transcript and overrides the per-cell Haiku tag. | Phase 5 (per-batch analysis) |
 
 ### `file_batch_issues.py` — usage
 
