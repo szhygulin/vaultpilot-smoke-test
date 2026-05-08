@@ -152,6 +152,28 @@ Coverage buckets: happy path; same action across contexts; multi-step flows; rea
 
 **Address book:** label 4 personas onto demo wallets so scripts exercise contact-resolution paths.
 
+## Golden canaries — regression-detection layer (supplement to Phase 2)
+
+Distinct from matrix sampling. Canaries are a small fixed set (~5–10) of scripts with known expected outcomes (defense layer, status, tricked-flag, role) that run on **every** batch alongside the rotated matrix sample. Source of truth: [`tools/canaries.json`](tools/canaries.json). At least one cell per A/B/C/D/E/F threat-model role.
+
+**Why this exists, separate from sampling:** matrix cells rotate batch-to-batch — a regression in week 3 can land on cells week 1 already covered, and the matrix's signal silently shifts without flagging the lost defense. Canaries pin a baseline: an attack that MUST be caught (e.g. recipient-swap → `defense_layer: invariant-2`) and an honest path that MUST succeed.
+
+**Pipeline integration:**
+
+1. `next-batch` prepends every canary to `batch-NN/scripts.json`. IDs `C001`–`C010` are reserved; matrix cell ids never start with `C\d{3}`.
+2. Canary cells dispatch identically to matrix cells (same prompt template, same role assignment).
+3. `mark-completed` validates each canary's transcript against its expected_* fields:
+   - **Match** → `summary.txt` opens with a `CANARIES OK` banner; close-out proceeds.
+   - **Drift** → `summary.txt` opens with a `CANARY DRIFT` block listing per-field expected vs. actual; `aggregate.json` records `canary_drift_count` and `canary_drifted_ids`; close-out is **blocked** unless `--ack-canary-drift` is passed.
+4. Canary outcomes are **excluded from matrix counters** (`by_role`, `by_defense_layer`, `e_false_positive_count`, etc.) and recorded as a separate `canary_results` section in `aggregate.json`. The Phase 5 analyst keeps them in their own `findings.md` section, not folded into the matrix-sample numbers.
+
+**When drift fires, the operator's two paths:**
+
+- **Investigate the regression.** Re-dispatch the canary cell, diff against prior batches, file an issue if the defense layer actually changed. Do NOT pass `--ack-canary-drift` to "make the test green" — that defeats the canary.
+- **Deliberate rebaseline.** A canary expectation in `tools/canaries.json` was updated this release (e.g. F coverage landed → expected_tricked: yes → no). Re-run with `--ack-canary-drift` to accept the drift and complete the batch. Document the rebaseline event in the commit that changes `canaries.json`.
+
+**Editing `tools/canaries.json`:** changes are deliberate baseline rebases. Each canary carries a `rationale` field naming what the canary protects against; preserve that on edits so future operators understand why the expectation is set.
+
 ## Phase 2.5 — Cost preflight (per-batch, mandatory)
 
 Before EVERY batch, surface the cost preflight block AND wait for explicit user OK on that specific batch. `next-batch` prints the block as a side-effect — printing is not confirmation.

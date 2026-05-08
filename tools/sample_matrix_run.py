@@ -53,6 +53,7 @@ from collections import Counter
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MATRIX_PATH = f'{REPO}/test-vectors/matrix.json'
+CANARIES_PATH = f'{REPO}/tools/canaries.json'
 SAMPLE_DIR = f'{REPO}/runs/matrix-sampled'
 PARTITION_PATH = f'{SAMPLE_DIR}/partition.json'
 PROGRESS_PATH = f'{SAMPLE_DIR}/progress.json'
@@ -126,6 +127,51 @@ def _flatten_all(apply_surface_filter: bool = True) -> list[dict]:
                 'role': role,
             })
     return cells
+
+
+def _load_canaries() -> list[dict]:
+    """Load golden canary scripts from tools/canaries.json. Returns a list of
+    hydrated cells matching the matrix-cell shape, with ``is_canary: True`` and
+    the original ``expected_*`` fields preserved.
+
+    Canaries are dispatched alongside matrix cells in every batch; their
+    expected outcomes (defense layer, status, tricked-flag, role) are validated
+    by the aggregator. See cmd_mark_completed for the close-out gate.
+
+    Returns an empty list if canaries.json is missing or has no entries — the
+    rest of the pipeline is canary-agnostic in that case.
+    """
+    if not os.path.exists(CANARIES_PATH):
+        return []
+    data = json.load(open(CANARIES_PATH))
+    out = []
+    seen_ids = set()
+    for c in data.get('canaries', []):
+        cid = c['id']
+        if not re.match(r'^C\d{3}$', cid):
+            sys.exit(f"canaries.json: id {cid!r} must match C\\d{{3}} "
+                     f"(e.g. C001..C010 reserved)")
+        if cid in seen_ids:
+            sys.exit(f"canaries.json: duplicate id {cid!r}")
+        seen_ids.add(cid)
+        cell = {
+            'id': cid,
+            'audience': c.get('audience', 'canary'),
+            'row_id': cid,
+            'role': c['role'],
+            'category': c.get('category', 'canary'),
+            'chain': c.get('chain'),
+            'script': c['script'],
+            'attack': c.get('attack', ''),
+            'is_canary': True,
+            'expected_status': c.get('expected_status'),
+            'expected_role': c.get('expected_role', c['role']),
+            'expected_defense_layer': c.get('expected_defense_layer'),
+            'expected_tricked': c.get('expected_tricked'),
+            'rationale': c.get('rationale', ''),
+        }
+        out.append(cell)
+    return out
 
 
 def cmd_init(args: argparse.Namespace) -> None:
@@ -294,6 +340,12 @@ def cmd_next_batch(args: argparse.Namespace) -> None:
             f"silently — log to runs/matrix-sampled/dropped-cells.log first).\n")
         sys.exit(1)
 
+    # Prepend canary cells (regression detectors) to the matrix sample.
+    # Canaries dispatch identically to matrix cells; the aggregator splits them
+    # back out via the `is_canary` flag and validates against expected_* fields.
+    canaries = _load_canaries()
+    hydrated = canaries + hydrated
+
     batch_dir = f'{SAMPLE_DIR}/batch-{batch_n:02d}'
     os.makedirs(batch_dir, exist_ok=True)
     # Pre-create transcripts/ so Phase 3 dispatch doesn't need a separate mkdir
@@ -304,12 +356,14 @@ def cmd_next_batch(args: argparse.Namespace) -> None:
     out = {
         '_comment': (
             f'Batch {batch_n} of {progress["total_batches"]} — '
-            f'{len(hydrated)} cells. Dispatch all of them concurrently '
-            'via skill/SKILL.md Phase 3.'
+            f'{len(hydrated)} cells ({len(canaries)} canaries + '
+            f'{len(hydrated) - len(canaries)} matrix-sampled). '
+            'Dispatch all of them concurrently via skill/SKILL.md Phase 3.'
         ),
         'batch': batch_n,
         'addressBook': matrix.get('addressBook', {}),
         'roleLegend': matrix.get('roleLegend', {}),
+        'canary_count': len(canaries),
         'scripts': hydrated,
     }
     with open(scripts_path, 'w') as f:
@@ -348,8 +402,15 @@ def cmd_next_batch(args: argparse.Namespace) -> None:
     role_summary = ', '.join(f"{r}: {n}" for r, n in sorted(role_counts.items()))
     print(f"Sample:     {len(hydrated)} cells "
           f"(expert: {audience_counts.get('expert', 0)}, "
-          f"newcomer: {audience_counts.get('newcomer', 0)})")
+          f"newcomer: {audience_counts.get('newcomer', 0)}, "
+          f"canary: {len(canaries)})")
     print(f"            roles: {role_summary}")
+    if canaries:
+        canary_ids = ', '.join(c['id'] for c in canaries)
+        print(f"            ℹ {len(canaries)} golden canaries "
+              f"({canary_ids}) prepended for regression detection. "
+              f"Validated against expected_* on mark-completed; drift "
+              f"blocks close-out unless --ack-canary-drift is passed.")
     if out_of_scope:
         print(f"            ℹ {out_of_scope} A.5/C.5 cells are advisory-text-only. "
               f"Findings get attribution `advisory-*` in issues.draft.json; user "
@@ -621,11 +682,95 @@ def _parse_transcripts(transcripts_dir: str) -> list[dict]:
     return records
 
 
+def _load_canary_expectations(batch_dir: str) -> dict[str, dict]:
+    """Read scripts.json from the batch dir and return a mapping
+    ``{canary_id: expected_dict}`` for every cell flagged ``is_canary: True``.
+    Empty dict if scripts.json is missing or has no canaries (legacy batches
+    pre-canary-feature aggregate cleanly with no drift).
+    """
+    scripts_path = f'{batch_dir}/scripts.json'
+    if not os.path.exists(scripts_path):
+        return {}
+    data = json.load(open(scripts_path))
+    out = {}
+    for c in data.get('scripts', []):
+        if not c.get('is_canary'):
+            continue
+        out[c['id']] = {
+            'expected_status': c.get('expected_status'),
+            'expected_role': c.get('expected_role'),
+            'expected_defense_layer': c.get('expected_defense_layer'),
+            'expected_tricked': c.get('expected_tricked'),
+            'rationale': c.get('rationale', ''),
+            'script': c.get('script', ''),
+            'attack': c.get('attack', ''),
+        }
+    return out
+
+
+def _validate_canary(rec: dict, expected: dict) -> dict:
+    """Compare one canary record against its expectations. Returns a dict with
+    ``id``, ``drifted`` flag, ``mismatches`` list (per-field actual vs expected
+    using the same canonicalizers the matrix aggregator uses), and the raw
+    actual values for the analyst to review.
+
+    A field is only checked when its ``expected_*`` is non-null in canaries.json
+    — missing expectations mean "not asserted" (informational), not "must be empty".
+    """
+    mismatches = []
+
+    def _check(field: str, actual_val: str, expected_raw, canonicalizer):
+        if expected_raw is None:
+            return  # field not asserted
+        expected_canonical = canonicalizer(expected_raw)
+        if actual_val != expected_canonical:
+            mismatches.append({
+                'field': field,
+                'expected': expected_canonical,
+                'expected_raw': expected_raw,
+                'actual': actual_val,
+            })
+
+    _check('outcome_status', rec.get('outcome_status', 'unknown'),
+           expected.get('expected_status'), _canonicalize_outcome_status)
+    _check('role', rec.get('role', 'unknown'),
+           expected.get('expected_role'), _canonicalize_role)
+    _check('defense_layer', rec.get('defense_layer', 'unknown'),
+           expected.get('expected_defense_layer'), _canonicalize_defense_layer)
+    _check('did_user_get_tricked', rec.get('did_user_get_tricked', 'unknown'),
+           expected.get('expected_tricked'), _canonicalize_tricked)
+
+    return {
+        'id': rec.get('script_id', rec.get('file', '?').replace('.txt', '')),
+        'file': rec.get('file', '?'),
+        'drifted': bool(mismatches),
+        'mismatches': mismatches,
+        'actual': {
+            'outcome_status': rec.get('outcome_status'),
+            'role': rec.get('role'),
+            'defense_layer': rec.get('defense_layer'),
+            'did_user_get_tricked': rec.get('did_user_get_tricked'),
+        },
+        'expected': {
+            'expected_status': expected.get('expected_status'),
+            'expected_role': expected.get('expected_role'),
+            'expected_defense_layer': expected.get('expected_defense_layer'),
+            'expected_tricked': expected.get('expected_tricked'),
+        },
+    }
+
+
 def _aggregate_batch(batch_n: int, transcripts_dir: str | None = None,
                     quiet: bool = False) -> dict | None:
     """Run the quick aggregate over a batch's transcripts. Writes
     summary.txt + aggregate.json under runs/matrix-sampled/batch-NN/.
-    Returns the aggregate dict, or None if no transcripts found."""
+    Returns the aggregate dict, or None if no transcripts found.
+
+    Canary handling: cells whose id matches a canary entry in scripts.json are
+    split out, validated against their expected_* fields, and aggregated as
+    ``canary_results``. Canary records are EXCLUDED from the matrix counters
+    (by_role, by_defense_layer, etc.) so a fixed canary set doesn't skew the
+    sampled matrix's signal."""
     batch_dir = f'{SAMPLE_DIR}/batch-{batch_n:02d}'
     if transcripts_dir is None:
         transcripts_dir = f'{batch_dir}/transcripts'
@@ -641,9 +786,88 @@ def _aggregate_batch(batch_n: int, transcripts_dir: str | None = None,
             print(f"  (no transcripts in {transcripts_dir} — skipping aggregate)")
         return None
 
+    # Load canary expectations from scripts.json and split records via
+    # file-name set (O(n) lookup; avoids dict-equality pitfalls).
+    canary_expectations = _load_canary_expectations(batch_dir)
+    canary_ids = set(canary_expectations.keys())
+    canary_records = []
+    canary_files = set()
+    found_canary_ids = set()
+    canary_results = []
+    for r in records:
+        sid = r.get('script_id') or r['file'].replace('.txt', '')
+        if sid in canary_ids:
+            canary_records.append(r)
+            canary_files.add(r['file'])
+            found_canary_ids.add(sid)
+            canary_results.append(_validate_canary(r, canary_expectations[sid]))
+    matrix_records = [r for r in records if r['file'] not in canary_files]
+    # Missing canaries: scripts.json declared a canary but no transcript landed.
+    # That's a drift event — could mean the dispatch silently skipped a cell.
+    for cid in sorted(canary_ids - found_canary_ids):
+        canary_results.append({
+            'id': cid,
+            'file': None,
+            'drifted': True,
+            'mismatches': [{
+                'field': '__transcript__',
+                'expected': '<transcript present>',
+                'expected_raw': None,
+                'actual': '<missing>',
+            }],
+            'actual': None,
+            'expected': {
+                'expected_status': canary_expectations[cid].get('expected_status'),
+                'expected_role': canary_expectations[cid].get('expected_role'),
+                'expected_defense_layer': canary_expectations[cid].get('expected_defense_layer'),
+                'expected_tricked': canary_expectations[cid].get('expected_tricked'),
+            },
+        })
+
+    canary_drift_count = sum(1 for cr in canary_results if cr['drifted'])
+    drifted_canaries = [cr for cr in canary_results if cr['drifted']]
+
+    # Write summary.txt with the CANARY DRIFT block at the top (if any drift).
     summary_path = f'{batch_dir}/summary.txt'
     with open(summary_path, 'w') as o:
-        for r in records:
+        if canary_drift_count > 0:
+            o.write("=" * 64 + "\n")
+            o.write(f"CANARY DRIFT — {canary_drift_count} of {len(canary_results)} "
+                    f"canaries failed validation. Batch close-out blocked unless "
+                    f"--ack-canary-drift is passed.\n")
+            o.write("=" * 64 + "\n")
+            for cr in drifted_canaries:
+                o.write(f"\n  {cr['id']} ({cr.get('file') or 'no transcript'}):\n")
+                for m in cr['mismatches']:
+                    o.write(f"    - {m['field']}: expected={m['expected']!r}, "
+                            f"actual={m['actual']!r}\n")
+            o.write("\n" + "=" * 64 + "\n")
+            o.write("END CANARY DRIFT\n")
+            o.write("=" * 64 + "\n\n")
+        elif canary_results:
+            o.write("=" * 64 + "\n")
+            o.write(f"CANARIES OK — {len(canary_results)} canaries all matched "
+                    f"expectations.\n")
+            o.write("=" * 64 + "\n\n")
+
+        # Canary records (informational, separate from matrix).
+        if canary_records:
+            o.write("--- canary transcripts (excluded from matrix counters) ---\n")
+            for r in canary_records:
+                sid = r.get('script_id', r['file'].replace('.txt', ''))
+                role = r.get('role', '?')
+                o.write(f"=== CANARY {sid} | role:{role} | {r.get('category','?')} ===\n")
+                if 'script' in r:
+                    o.write(f"SCRIPT: {r['script'][:200]}\n")
+                if 'attack' in r:
+                    o.write(f"ATTACK: {r['attack'][:200]}\n")
+                if r.get('outcome'):
+                    o.write(f"OUTCOME: {r['outcome']}\n")
+                o.write(f"ADVERSARIAL_RESULT:\n{r['adv'][:1500]}\n\n")
+            o.write("--- end canary section ---\n\n")
+
+        # Matrix records.
+        for r in matrix_records:
             sid = r.get('script_id', r['file'].replace('.txt', ''))
             role = r.get('role', '?')
             o.write(f"=== {sid} | role:{role} | {r.get('category','?')} ===\n")
@@ -655,25 +879,29 @@ def _aggregate_batch(batch_n: int, transcripts_dir: str | None = None,
                 o.write(f"OUTCOME: {r['outcome']}\n")
             o.write(f"ADVERSARIAL_RESULT:\n{r['adv'][:1500]}\n\n")
 
-    by_layer = Counter(r['defense_layer'] for r in records)
-    by_tricked = Counter(r['did_user_get_tricked'] for r in records)
-    by_role = Counter(r.get('role', '?') for r in records)
-    by_outcome_status = Counter(r['outcome_status'] for r in records)
-    by_refusal_class = Counter(r['refusal_class'] for r in records
+    # Counters computed from MATRIX records only — canaries are deliberately
+    # excluded so their fixed set doesn't skew the sampled matrix's signal.
+    by_layer = Counter(r['defense_layer'] for r in matrix_records)
+    by_tricked = Counter(r['did_user_get_tricked'] for r in matrix_records)
+    by_role = Counter(r.get('role', '?') for r in matrix_records)
+    by_outcome_status = Counter(r['outcome_status'] for r in matrix_records)
+    by_refusal_class = Counter(r['refusal_class'] for r in matrix_records
                                if r['outcome_status'] == 'refused')
     # A.5/C.5 attribution split (only meaningful for those rows; per issue #21).
-    by_a5_attribution = Counter(r['a5_attribution'] for r in records
+    by_a5_attribution = Counter(r['a5_attribution'] for r in matrix_records
                                 if r.get('role') in ('A.5', 'C.5'))
     # E rows where a defense BLOCKED an honest flow = false-positive findings.
     # Tightened heuristic (Lane 1 / batch-2 finding): only flag when the
     # defense actually refused the flow, AND the refusal_class isn't 'tool-gap'
     # (tool-gap means MCP can't do it — feature gap, not over-trigger).
-    e_firings = [r for r in records
+    e_firings = [r for r in matrix_records
                  if r.get('role') == 'E'
                  and r['defense_layer'] not in ('none', 'other', 'unknown')
                  and r['outcome_status'] == 'refused'
                  and r['refusal_class'] != 'tool-gap']
-    # Aggregate parse-failure list (Lane 1: no silent skips).
+    # Aggregate parse-failure list (Lane 1: no silent skips). Includes parse
+    # failures from both canaries and matrix records — a parse failure on a
+    # canary is just as actionable as on a matrix cell.
     all_parse_failures = []
     for r in records:
         for pf in r.get('parse_failures', []):
@@ -683,6 +911,8 @@ def _aggregate_batch(batch_n: int, transcripts_dir: str | None = None,
     aggregate = {
         'batch': batch_n,
         'total_transcripts': len(records),
+        'matrix_transcripts': len(matrix_records),
+        'canary_transcripts': len(canary_records),
         'by_defense_layer': dict(by_layer),
         'by_did_user_get_tricked': dict(by_tricked),
         'by_role': dict(by_role),
@@ -695,8 +925,11 @@ def _aggregate_batch(batch_n: int, transcripts_dir: str | None = None,
         'parse_failures': all_parse_failures,
         'tricked_count': tricked,
         'tricked_script_ids': [r.get('script_id', r['file'].replace('.txt', ''))
-                               for r in records
+                               for r in matrix_records
                                if r['did_user_get_tricked'] == 'yes'],
+        'canary_results': canary_results,
+        'canary_drift_count': canary_drift_count,
+        'canary_drifted_ids': [cr['id'] for cr in drifted_canaries],
     }
     aggregate_path = f'{batch_dir}/aggregate.json'
     with open(aggregate_path, 'w') as f:
@@ -705,8 +938,20 @@ def _aggregate_batch(batch_n: int, transcripts_dir: str | None = None,
     if not quiet:
         print(f"  wrote {summary_path}")
         print(f"  wrote {aggregate_path}")
-        print(f"  transcripts:          {len(records)}")
-        print(f"  by role:              {dict(by_role)}")
+        print(f"  transcripts:          {len(records)} "
+              f"(canaries: {len(canary_records)}, matrix: {len(matrix_records)})")
+        if canary_results:
+            if canary_drift_count > 0:
+                print(f"  ⚠ CANARY DRIFT:       {canary_drift_count} of "
+                      f"{len(canary_results)} canaries failed validation — "
+                      f"{[cr['id'] for cr in drifted_canaries]}")
+                print(f"     (see CANARY DRIFT block at top of {summary_path}; "
+                      f"`mark-completed` will block close-out without "
+                      f"--ack-canary-drift)")
+            else:
+                print(f"  canaries:             {len(canary_results)} OK "
+                      f"(all expected_* matched)")
+        print(f"  by role (matrix):     {dict(by_role)}")
         if by_a5_attribution:
             print(f"  A.5/C.5 attribution:  {dict(by_a5_attribution)} (analyst tags as `advisory-*` in issues.draft.json)")
         print(f"  by outcome status:    {dict(by_outcome_status)}")
@@ -757,6 +1002,36 @@ def cmd_mark_completed(args: argparse.Namespace) -> None:
     if not batch:
         sys.exit(f"Batch {args.batch} not in partition (have batches "
                  f"1..{progress['total_batches']}).")
+
+    # Aggregate FIRST so we can gate close-out on canary drift. The previous
+    # order (mark complete → aggregate) made it impossible to refuse the
+    # close-out: by the time drift was visible, progress was already updated.
+    agg = None
+    if not args.skip_aggregate:
+        print(f"Auto-aggregating batch {args.batch}...")
+        agg = _aggregate_batch(args.batch, transcripts_dir=args.transcripts)
+        print()
+
+    drift_count = (agg or {}).get('canary_drift_count', 0)
+    if drift_count > 0 and not args.ack_canary_drift:
+        batch_dir = f'{SAMPLE_DIR}/batch-{args.batch:02d}'
+        sys.stderr.write(
+            f"\n⚠ CANARY DRIFT — {drift_count} canary(ies) failed validation "
+            f"on batch {args.batch}.\n"
+            f"  Drifted: {agg.get('canary_drifted_ids', [])}\n"
+            f"  See:     {batch_dir}/summary.txt (CANARY DRIFT block at top)\n"
+            f"           {batch_dir}/aggregate.json#canary_results\n\n"
+            f"Batch close-out is BLOCKED. Either:\n"
+            f"  (a) investigate the regression — re-dispatch the canary cell, "
+            f"diff against prior batches, file an issue if the defense layer "
+            f"actually changed; OR\n"
+            f"  (b) if the drift is a deliberate rebaseline (canary "
+            f"expectation updated this release), re-run with "
+            f"`--ack-canary-drift` to accept the drift and complete the "
+            f"batch.\n"
+        )
+        sys.exit(1)
+
     batch['status'] = 'completed'
     batch['completed_at'] = _now()
     if args.transcripts:
@@ -764,21 +1039,22 @@ def cmd_mark_completed(args: argparse.Namespace) -> None:
     with open(PROGRESS_PATH, 'w') as f:
         json.dump(progress, f, indent=2)
     print(f"batch {args.batch} marked completed at {batch['completed_at']}")
+    if drift_count > 0 and args.ack_canary_drift:
+        print(f"  (canary drift acknowledged via --ack-canary-drift; "
+              f"{drift_count} drifted canary(ies) recorded in aggregate.json)")
 
-    if not args.skip_aggregate:
+    if agg is not None:
+        batch_dir = f'{SAMPLE_DIR}/batch-{args.batch:02d}'
         print()
-        print(f"Auto-aggregating batch {args.batch}...")
-        agg = _aggregate_batch(args.batch, transcripts_dir=args.transcripts)
-        if agg is not None:
-            batch_dir = f'{SAMPLE_DIR}/batch-{args.batch:02d}'
-            print()
-            print(f"Next steps (orchestrator):")
-            print(f"  1. Per-batch findings: delegate analysis subagent over")
-            print(f"     {batch_dir}/summary.txt → write {batch_dir}/findings.md")
-            print(f"  2. File issues: draft GitHub issues from findings.md and")
-            print(f"     file via gh; record URLs in {batch_dir}/issues.md")
-            print(f"  3. (Optional) cumulative analysis once enough batches "
-                  f"have run.")
+        print(f"Next steps (orchestrator):")
+        print(f"  1. Per-batch findings: delegate analysis subagent over")
+        print(f"     {batch_dir}/summary.txt → write {batch_dir}/findings.md")
+        print(f"     (canary results are pre-segmented; analyst must keep them")
+        print(f"     in a separate findings.md section, not folded into matrix counters)")
+        print(f"  2. File issues: draft GitHub issues from findings.md and")
+        print(f"     file via gh; record URLs in {batch_dir}/issues.md")
+        print(f"  3. (Optional) cumulative analysis once enough batches "
+              f"have run.")
 
 
 def cmd_inspect_batch(args: argparse.Namespace) -> None:
@@ -971,6 +1247,11 @@ def main() -> None:
                                               '(default: runs/matrix-sampled/batch-NN/transcripts).')
     p_mark.add_argument('--skip-aggregate', action='store_true',
                         help="Don't auto-run the aggregate step.")
+    p_mark.add_argument('--ack-canary-drift', action='store_true',
+                        help='Acknowledge canary drift and proceed with '
+                             'close-out anyway. Use when the drift is a '
+                             'deliberate rebaseline (e.g. canary '
+                             'expectation updated this release).')
     p_mark.set_defaults(func=cmd_mark_completed)
 
     p_agg = sub.add_parser('aggregate-batch',
