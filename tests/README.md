@@ -34,6 +34,7 @@ Exits 0 if all suites pass; non-zero on any failure. Per-suite logs at `tests/.l
 | `suites/10-canonicalizers.sh` | Every `_canonicalize_*` function | Silent re-bucketing of `unknown` / `other` if a canonicalizer regresses |
 | `suites/20-parser.sh` | `_parse_transcripts` | The `\bROLE:` regex bug that mis-matched "MCP ROLE:" in notes |
 | `suites/30-aggregator.sh` | `_aggregate_batch` | `parse_failures` not surfaced; E false-positive heuristic regression |
+| `suites/35-calibration.sh` | `_select_calibration_ids`, `_aggregate_calibration`, `enable-calibration` | Issue #48 calibration tagging losing determinism; field-disagreement diff regressions; backward-compat (no `calibration_fraction` set) accidentally tagging cells |
 | `suites/40-preflight-hook.sh` | `.claude/hooks/preflight_gate.sh` | Hook letting Agent calls through without a stamp; or blocking when no batch in_progress |
 | `suites/50-next-batch.sh` | `cmd_next_batch` | Malformed cells silently dispatched (Lane 1 policy violation) |
 | `suites/60-verify-transcripts.sh` | `cmd_verify_transcripts` | Failure to detect or repair missing `[ADVERSARIAL_RESULT]` headers |
