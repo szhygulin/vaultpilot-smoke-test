@@ -31,6 +31,12 @@ python3 tools/file_batch_issues.py --batch N --repo OWNER/REPO --only 1,3,7
 
 # Refuse to fall back on missing-attribution; force the analyst to commit
 python3 tools/file_batch_issues.py --batch N --repo OWNER/REPO --strict-attribution
+
+# Cross-batch dedup: search each issue's routed target repo per draft, link a
+# comment instead of filing a duplicate. Always use for matrix runs.
+python3 tools/file_batch_issues.py --batch N --repo OWNER/REPO --dedup --dry-run
+python3 tools/file_batch_issues.py --batch N --repo OWNER/REPO --dedup
+python3 tools/file_batch_issues.py --batch N --repo OWNER/REPO --dedup --on-dup skip
 ```
 
 Routing by `attribution`:
@@ -38,9 +44,11 @@ Routing by `attribution`:
 - `skill-defect` → `--skill-repo` (optional; if unset, listed in the unrouted summary)
 - `advisory-injection-shaped` / `advisory-model-shaped` → `--advisory-repo` (optional; default: NOT filed, listed in `runs/matrix-sampled/batch-NN/advisory-upstream.md`)
 
-Input: `runs/matrix-sampled/batch-NN/issues.draft.json` (schema documented in the file's docstring; the Phase 5 analysis subagent emits it per `CLAUDE.md` *Smoke-test methodology* section, Phase 5 step 5.5). Output: appends a markdown table of filed-issue URLs to `runs/matrix-sampled/batch-NN/issues.md`, and writes any unrouted findings to `advisory-upstream.md`.
+Input: `runs/matrix-sampled/batch-NN/issues.draft.json` (schema documented in the file's docstring; the Phase 5 analysis subagent emits it per `CLAUDE.md` *Smoke-test methodology* section, Phase 5 step 5.5). Output: appends a markdown table of filed-issue URLs to `runs/matrix-sampled/batch-NN/issues.md`, and writes any unrouted findings to `advisory-upstream.md`. With `--dedup`, also writes per-draft decisions to `runs/matrix-sampled/batch-NN/dedup.log`.
 
 Pre-req: `gh auth status` clean. Labels referenced in `issues.draft.json` must exist on the repo (or be pre-created via `gh label create`); the script does not auto-create labels.
+
+Dedup match rule: a candidate from `gh issue list --search` matches a draft when (1) the normalized title-stems overlap as substrings either direction, AND (2) the draft's labels intersect the candidate's labels (skipped when the draft has no labels). `--on-dup` selects: `link` (default — comment on existing), `skip` (drop), `file` (file new anyway), `prompt` (interactive — falls back to `link` in non-TTY contexts).
 
 ### `sample_matrix_run.py` — usage
 
