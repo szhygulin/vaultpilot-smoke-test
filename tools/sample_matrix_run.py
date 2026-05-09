@@ -18,7 +18,7 @@ Sampling strategy:
   - Shuffle once with a fixed seed (default 42) — deterministic, reproducible.
   - Slice into batches of N cells, where
         N = floor(SESSION_ALL_MODELS × BATCH_SESSION_FRACTION / TOKENS_PER_CELL)
-    Defaults (post batch-1 recalibration): 5M × 0.25 / 130k ≈ 9 cells/batch
+    Defaults (post batch-5 recalibration): 5M × 0.25 / 50k ≈ 25 cells/batch
     for new partitions. Existing partition.json captured at init time keeps
     its old anchor and batch_size — change applies only on re-init. Note:
     Haiku is quota-free per the user's Max-x20 dashboard observation, so the
@@ -107,11 +107,17 @@ from surface_taxonomy import is_low_yield  # noqa: E402
 # if these don't match what you see on https://console.anthropic.com .
 DEFAULT_ALL_MODELS_WEEKLY = 50_000_000  # placeholder; verify against dashboard
 DEFAULT_SESSION_ALL_MODELS = 5_000_000  # placeholder 5-hour rolling window cap
-DEFAULT_TOKENS_PER_CELL = 130_000       # measured Haiku adversarial-cell average across batch-1's 50 subagents (range ~125-155k); quota-free per dashboard
-                                        # Earlier 25k anchor was from a smaller-corpus
-                                        # honest-mode pre-14-role measurement; 14-role
-                                        # adversarial cells with full preflight + MCP
-                                        # tool calls measure ~5x higher.
+DEFAULT_TOKENS_PER_CELL = 50_000        # measured Haiku adversarial-cell average across batch-5's 56 subagents (~45k, range 44.4k-46.8k); quota-free per dashboard
+                                        # Anchor history:
+                                        #   25k — pre-14-role honest-mode measurement.
+                                        #   130k — batch-1's 50 subagents (range ~125-155k), when
+                                        #     adversarial cells invoked MCP tools and ran multi-step
+                                        #     preflight on-chain.
+                                        #   50k — current. Post-28537d2 cell-prompt simplification, the
+                                        #     dispatch subagent's tool-call shape collapsed to 2 calls
+                                        #     (Read prompt + Write transcript), with simulated MCP
+                                        #     interaction in transcript prose; per-cell footprint
+                                        #     dropped ~2.9x. Rounded up from observed 45k for headroom.
 DEFAULT_ANALYSIS_TOKENS = 82_000        # measured Phase 5 Opus analysis run on batch-1 (was 100k anchor; now using observed)
 DEFAULT_BATCH_SESSION_FRACTION = 0.25   # batch fills this much of one 5-hour session
                                         # (Phase D resample: tightened from 0.5
@@ -2048,7 +2054,7 @@ def main() -> None:
                         help='5-hour all-models cap in tokens (default: 5M; tune to plan)')
     p_init.add_argument('--per-cell', dest='per_cell',
                         type=int, default=DEFAULT_TOKENS_PER_CELL,
-                        help='Tokens per cell estimate (default: 130k — batch-1 measured)')
+                        help='Tokens per cell estimate (default: 50k — batch-5 measured)')
     p_init.add_argument('--analysis-tokens', dest='analysis_tokens',
                         type=int, default=DEFAULT_ANALYSIS_TOKENS,
                         help='Phase 5 analysis subagent token estimate '

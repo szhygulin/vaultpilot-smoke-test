@@ -208,7 +208,7 @@ Before EVERY batch, surface the cost preflight block AND wait for explicit user 
 ### Per-subagent token anchors
 
 - Honest mode (Haiku per-cell): ~35k total.
-- Adversarial mode (Haiku per-cell, full preflight + multi-tool): **~130k total** per subagent (post-batch-1 measured average).
+- Adversarial mode (Haiku per-cell, simulated MCP via Read + Write only): **~50k total** per subagent (batch-5 measured average ~45k, rounded up for headroom). Earlier batch-1 anchor of ~130k reflected actual MCP tool calls + multi-step preflight; post-28537d2 cell-prompt simplification dropped the per-cell footprint ~2.9x.
 - Phase 5 analysis subagent (Opus): **~82k total** (batch-1 measured).
 
 Quota-relevant total ≈ analysis subagent only — Haiku doesn't deplete weekly buckets on Max-x20.
@@ -246,7 +246,7 @@ python3 tools/sample_matrix_run.py mark-completed --batch NN     # 2. auto-aggre
 # 4. orchestrator files via tools/file_batch_issues.py → batch-NN/issues.md
 ```
 
-Batch sizing: at the post-batch-1 anchor (130k/cell), `init` slices ~9 cells/batch ≈ 1000 batches for the 9020-cell matrix. Existing batch-1 partition kept its old 25k anchor (50 cells) — that's fine; partition is captured at init.
+Batch sizing: at the post-batch-5 anchor (50k/cell), `init` slices ~25 cells/batch ≈ 360 batches for the 9020-cell matrix. Existing partitions captured at init time keep their original anchor and batch_size — the change applies only on re-init.
 
 ### Per-batch quality gate (stop-the-line)
 
