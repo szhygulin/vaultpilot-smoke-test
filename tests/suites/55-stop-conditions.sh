@@ -31,12 +31,13 @@ cp "$REPO_ROOT/tools/stop_conditions.json" "$TMP/tools/"
 
 # -----------------------------------------------------------------------------
 # Test 1: _evaluate_stop_conditions writes batch-NN/stop_conditions.json
-#         and triggers tricked_yes_count when count > max.
+#         and triggers tool_surface_tricked_yes_count when count > max.
+#         (Issue #71 split — tool-surface roles use the tight bound.)
 # -----------------------------------------------------------------------------
 BATCH_DIR="$TMP/runs/matrix-sampled/batch-99"
 mkdir -p "$BATCH_DIR"
 
-# Synth aggregate with 3 tricked-yes (above default max=2).
+# Synth aggregate with 3 tool-surface tricked-yes (above default max=2).
 python3 -c "
 import json
 agg = {
@@ -46,6 +47,8 @@ agg = {
     'parse_failures': [],
     'e_false_positive_count': 0,
     'tricked_count': 3,
+    'tool_surface_tricked_count': 3,
+    'advisory_tricked_count': 0,
 }
 json.dump(agg, open('$BATCH_DIR/aggregate.json', 'w'), indent=2)
 "
@@ -64,16 +67,17 @@ import json as _j; print(_j.dumps(report, indent=2))
 
 assert_file_exists "$BATCH_DIR/stop_conditions.json" "stop_conditions.json written"
 TRIG_COUNT=$(echo "$OUT" | jq -r '.triggered | length')
-assert_equals "1" "$TRIG_COUNT" "exactly 1 condition triggered (tricked_yes_count > 2)"
+assert_equals "1" "$TRIG_COUNT" "exactly 1 condition triggered (tool_surface_tricked_yes_count > 2)"
 TRIG_NAME=$(echo "$OUT" | jq -r '.triggered[0].name')
-assert_equals "tricked_yes_count" "$TRIG_NAME" "triggered rule named tricked_yes_count"
+assert_equals "tool_surface_tricked_yes_count" "$TRIG_NAME" "triggered rule named tool_surface_tricked_yes_count"
 TRIG_MEASURE=$(echo "$OUT" | jq -r '.triggered[0].measure')
 assert_equals "3" "$TRIG_MEASURE" "triggered measure = 3"
 
 # Forward-compat: canary_drift_count + calibration_disagreement_rate_pct should
-# NOT have been evaluated (fields absent in this aggregate.json).
+# NOT have been evaluated (fields absent in this aggregate.json). Both new
+# tricked-yes splits ARE evaluated since the test populates them.
 EVAL_COUNT=$(echo "$OUT" | jq -r '.evaluated_count')
-assert_equals "3" "$EVAL_COUNT" "evaluated_count = 3 (only the rules whose measures are present)"
+assert_equals "4" "$EVAL_COUNT" "evaluated_count = 4 (tool_surface + advisory + e_row + parse_failure)"
 
 # -----------------------------------------------------------------------------
 # Test 2: clean batch — no rule triggers.
@@ -87,6 +91,8 @@ agg = {
     'parse_failures': [],
     'e_false_positive_count': 0,
     'tricked_count': 0,
+    'tool_surface_tricked_count': 0,
+    'advisory_tricked_count': 0,
 }
 json.dump(agg, open('$BATCH_DIR/aggregate.json', 'w'), indent=2)
 "
@@ -117,6 +123,8 @@ agg = {
     'parse_failures': [],
     'e_false_positive_count': 2,
     'tricked_count': 0,
+    'tool_surface_tricked_count': 0,
+    'advisory_tricked_count': 0,
 }
 json.dump(agg, open('$BATCH_DIR/aggregate.json', 'w'), indent=2)
 "
@@ -151,6 +159,8 @@ agg = {
     ],
     'e_false_positive_count': 0,
     'tricked_count': 0,
+    'tool_surface_tricked_count': 0,
+    'advisory_tricked_count': 0,
 }
 json.dump(agg, open('$BATCH_DIR/aggregate.json', 'w'), indent=2)
 "
@@ -180,6 +190,8 @@ agg = {
     'parse_failures': [],
     'e_false_positive_count': 0,
     'tricked_count': 0,
+    'tool_surface_tricked_count': 0,
+    'advisory_tricked_count': 0,
     'canary_drift_count': 1,
 }
 json.dump(agg, open('$BATCH_DIR/aggregate.json', 'w'), indent=2)
@@ -198,7 +210,7 @@ import json as _j; print(_j.dumps(report, indent=2))
 TRIG_NAMES=$(echo "$OUT" | jq -r '.triggered[].name' | sort | tr '\n' ',')
 assert_contains "$TRIG_NAMES" "canary_drift_count" "forward-compat: canary_drift_count fires when present"
 EVAL_COUNT=$(echo "$OUT" | jq -r '.evaluated_count')
-assert_equals "4" "$EVAL_COUNT" "evaluated_count = 4 (canary now active, calibration still absent)"
+assert_equals "5" "$EVAL_COUNT" "evaluated_count = 5 (tool_surface + advisory + e_row + parse_failure + canary_drift; calibration still absent)"
 
 # -----------------------------------------------------------------------------
 # Test 6: next-batch BLOCKS when previous batch has unacknowledged triggers.
@@ -207,7 +219,7 @@ assert_equals "4" "$EVAL_COUNT" "evaluated_count = 4 (canary now active, calibra
 # -----------------------------------------------------------------------------
 python3 -c "
 import json
-# Re-trigger the 3-tricked aggregate.
+# Re-trigger the 3-tricked aggregate (all tool-surface).
 agg = {
     'batch': 99,
     'total_transcripts': 50,
@@ -215,6 +227,8 @@ agg = {
     'parse_failures': [],
     'e_false_positive_count': 0,
     'tricked_count': 3,
+    'tool_surface_tricked_count': 3,
+    'advisory_tricked_count': 0,
 }
 json.dump(agg, open('$BATCH_DIR/aggregate.json', 'w'), indent=2)
 "
@@ -275,7 +289,7 @@ OUT=$(python3 tools/sample_matrix_run.py next-batch 2>&1)
 EC=$?
 set -e
 assert_exit_code 1 "$EC" "next-batch refuses with unacknowledged triggers"
-assert_contains "$OUT" "tricked_yes_count" "stderr names the triggered rule"
+assert_contains "$OUT" "tool_surface_tricked_yes_count" "stderr names the triggered rule"
 assert_contains "$OUT" "ack-stops" "stderr surfaces the override path"
 assert_contains "$OUT" "stop_conditions.json" "stderr points at the report file"
 
@@ -323,6 +337,7 @@ agg = {
     'batch': 99, 'total_transcripts': 50,
     'by_role': {'E': 5, 'A.4': 45}, 'parse_failures': [],
     'e_false_positive_count': 0, 'tricked_count': 0,
+    'tool_surface_tricked_count': 0, 'advisory_tricked_count': 0,
 }
 json.dump(agg, open('$BATCH_DIR/aggregate.json', 'w'), indent=2)
 smr._evaluate_stop_conditions(99, agg)
@@ -338,22 +353,22 @@ assert_contains "$OUT" "no triggered" "stderr explains nothing to acknowledge"
 
 # -----------------------------------------------------------------------------
 # Test 10: thresholds tunable via stop_conditions.json (no code changes).
-#         Tighten tricked_yes_count.max to 0; previously-clean batch (tricked=0)
-#         still passes; raise tricked_count to 1 → triggers under tightened max.
+#         Tighten tool_surface_tricked_yes_count.max to 0; tool_surface=1 → triggers.
 # -----------------------------------------------------------------------------
 python3 -c "
 import json
 cfg = json.load(open('$TMP/tools/stop_conditions.json'))
-cfg['thresholds']['tricked_yes_count']['max'] = 0
+cfg['thresholds']['tool_surface_tricked_yes_count']['max'] = 0
 json.dump(cfg, open('$TMP/tools/stop_conditions.json', 'w'), indent=2)
 "
-# tricked_count=1 > max=0 → triggers under the tightened threshold.
+# tool_surface_tricked_count=1 > max=0 → triggers under the tightened threshold.
 python3 -c "
 import json
 agg = {
     'batch': 99, 'total_transcripts': 50,
     'by_role': {'E': 5, 'A.4': 45}, 'parse_failures': [],
     'e_false_positive_count': 0, 'tricked_count': 1,
+    'tool_surface_tricked_count': 1, 'advisory_tricked_count': 0,
 }
 json.dump(agg, open('$BATCH_DIR/aggregate.json', 'w'), indent=2)
 "
@@ -369,7 +384,99 @@ report = smr._evaluate_stop_conditions(99, agg)
 import json as _j; print(_j.dumps(report, indent=2))
 ")
 TRIG_COUNT=$(echo "$OUT" | jq -r '.triggered | length')
-assert_equals "1" "$TRIG_COUNT" "tightened threshold (max=0) triggers on tricked=1"
+assert_equals "1" "$TRIG_COUNT" "tightened tool-surface threshold (max=0) triggers on tool_surface=1"
+TRIG_NAME=$(echo "$OUT" | jq -r '.triggered[0].name')
+assert_equals "tool_surface_tricked_yes_count" "$TRIG_NAME" "triggered rule named tool_surface_tricked_yes_count"
+
+# -----------------------------------------------------------------------------
+# Test 11: advisory_tricked_yes_count uses a SOFT bound (default max=8).
+#         A batch with tool_surface=2 (under tight max) + advisory=7 (under soft
+#         max) does NOT trigger — replicates the issue #71 batch-5 shape where
+#         the legacy combined gate fired spuriously.
+# -----------------------------------------------------------------------------
+# Restore default thresholds first (Test 10 mutated tool_surface.max to 0).
+python3 -c "
+import json
+cfg = json.load(open('$REPO_ROOT/tools/stop_conditions.json'))
+json.dump(cfg, open('$TMP/tools/stop_conditions.json', 'w'), indent=2)
+"
+python3 -c "
+import json
+agg = {
+    'batch': 99, 'total_transcripts': 50,
+    'by_role': {'E': 5, 'A.5': 7, 'A.4': 38}, 'parse_failures': [],
+    'e_false_positive_count': 0, 'tricked_count': 9,
+    'tool_surface_tricked_count': 2, 'advisory_tricked_count': 7,
+}
+json.dump(agg, open('$BATCH_DIR/aggregate.json', 'w'), indent=2)
+"
+OUT=$(python3 -c "
+import os, sys
+os.chdir('$TMP')
+sys.path.insert(0, 'tools')
+import sample_matrix_run as smr
+smr.SAMPLE_DIR = '$TMP/runs/matrix-sampled'
+smr.STOP_CONDITIONS_PATH = '$TMP/tools/stop_conditions.json'
+agg = __import__('json').load(open('$BATCH_DIR/aggregate.json'))
+report = smr._evaluate_stop_conditions(99, agg)
+import json as _j; print(_j.dumps(report, indent=2))
+")
+TRIG_COUNT=$(echo "$OUT" | jq -r '.triggered | length')
+assert_equals "0" "$TRIG_COUNT" "split gate: tool_surface=2 (≤2) + advisory=7 (≤8) → no trigger (issue #71 shape)"
+
+# But advisory=9 (over default soft max=8) DOES trigger.
+python3 -c "
+import json
+agg = {
+    'batch': 99, 'total_transcripts': 50,
+    'by_role': {'E': 5, 'A.5': 9, 'A.4': 36}, 'parse_failures': [],
+    'e_false_positive_count': 0, 'tricked_count': 9,
+    'tool_surface_tricked_count': 0, 'advisory_tricked_count': 9,
+}
+json.dump(agg, open('$BATCH_DIR/aggregate.json', 'w'), indent=2)
+"
+OUT=$(python3 -c "
+import os, sys
+os.chdir('$TMP')
+sys.path.insert(0, 'tools')
+import sample_matrix_run as smr
+smr.SAMPLE_DIR = '$TMP/runs/matrix-sampled'
+smr.STOP_CONDITIONS_PATH = '$TMP/tools/stop_conditions.json'
+agg = __import__('json').load(open('$BATCH_DIR/aggregate.json'))
+report = smr._evaluate_stop_conditions(99, agg)
+import json as _j; print(_j.dumps(report, indent=2))
+")
+TRIG_NAMES=$(echo "$OUT" | jq -r '.triggered[].name' | sort | tr '\n' ',')
+assert_contains "$TRIG_NAMES" "advisory_tricked_yes_count" "advisory soft bound triggers above default max=8"
+
+# -----------------------------------------------------------------------------
+# Test 12: backward-compat — pre-#71 aggregate.json (no split fields) skips
+#          the split rules silently rather than crashing.
+# -----------------------------------------------------------------------------
+python3 -c "
+import json
+agg = {
+    'batch': 99, 'total_transcripts': 50,
+    'by_role': {'E': 5, 'A.4': 45}, 'parse_failures': [],
+    'e_false_positive_count': 0, 'tricked_count': 5,
+}
+json.dump(agg, open('$BATCH_DIR/aggregate.json', 'w'), indent=2)
+"
+OUT=$(python3 -c "
+import os, sys
+os.chdir('$TMP')
+sys.path.insert(0, 'tools')
+import sample_matrix_run as smr
+smr.SAMPLE_DIR = '$TMP/runs/matrix-sampled'
+smr.STOP_CONDITIONS_PATH = '$TMP/tools/stop_conditions.json'
+agg = __import__('json').load(open('$BATCH_DIR/aggregate.json'))
+report = smr._evaluate_stop_conditions(99, agg)
+import json as _j; print(_j.dumps(report, indent=2))
+")
+EVAL_COUNT=$(echo "$OUT" | jq -r '.evaluated_count')
+assert_equals "2" "$EVAL_COUNT" "pre-#71 aggregate: only e_row + parse_failure evaluated (split rules skipped)"
+TRIG_COUNT=$(echo "$OUT" | jq -r '.triggered | length')
+assert_equals "0" "$TRIG_COUNT" "pre-#71 aggregate: no rules trigger (split fields absent → silently skipped)"
 
 cd "$REPO_ROOT"
 echo ""
