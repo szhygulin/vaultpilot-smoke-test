@@ -40,13 +40,16 @@ PYEOF
 )
 
 # 1. Structure: all expected top-level keys present.
-for k in batch total_transcripts by_defense_layer by_did_user_get_tricked by_role by_outcome_status by_refusal_class by_a5_attribution e_false_positive_count e_false_positive_script_ids parse_failures tricked_count tricked_script_ids; do
+for k in batch total_transcripts by_defense_layer by_did_user_get_tricked by_role by_outcome_status by_refusal_class by_a5_attribution e_false_positive_count e_false_positive_script_ids parse_failures tricked_count tricked_script_ids tool_surface_tricked_count tool_surface_tricked_script_ids advisory_tricked_count advisory_tricked_script_ids; do
     assert_contains "$AGG_JSON" "\"$k\":" "aggregate.json contains key '$k'"
 done
 
 # 2. Counters
 assert_equals "5"       "$(echo "$AGG_JSON" | jq -r '.total_transcripts')" "aggregate: 5 transcripts"
 assert_equals "0"       "$(echo "$AGG_JSON" | jq -r '.tricked_count')"     "aggregate: 0 tricked"
+# Issue #71 split fields (no tricked records in this fixture → both 0).
+assert_equals "0"       "$(echo "$AGG_JSON" | jq -r '.tool_surface_tricked_count')" "aggregate: 0 tool-surface tricked"
+assert_equals "0"       "$(echo "$AGG_JSON" | jq -r '.advisory_tricked_count')"     "aggregate: 0 advisory tricked"
 
 # 3. by_role distribution: expected A.4=1, B=1, E=3
 assert_equals "1" "$(echo "$AGG_JSON" | jq -r '.by_role."A.4"')" "by_role.A.4 = 1"

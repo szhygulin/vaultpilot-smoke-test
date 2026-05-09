@@ -81,6 +81,13 @@ PARTITION_PATH = f'{SAMPLE_DIR}/partition.json'
 PROGRESS_PATH = f'{SAMPLE_DIR}/progress.json'
 STOP_CONDITIONS_PATH = f'{REPO}/tools/stop_conditions.json'
 
+# Threat-model roles whose `did_user_get_tricked: yes` outcomes are
+# architecturally upstream-routed (chat-client filter / model-layer safety
+# per smoke-test #52) rather than fixable at the MCP/skill layer. Used by
+# the per-batch quality gate to split the tricked-yes count into a tight
+# tool-surface bound vs a soft advisory bound (issue #71).
+ADVISORY_ROLES = ('A.5', 'C.5')
+
 # Make sibling modules in tools/ importable when this file runs as a script.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from surface_taxonomy import is_low_yield  # noqa: E402
@@ -1225,6 +1232,17 @@ def _aggregate_batch(batch_n: int, transcripts_dir: str | None = None,
             all_parse_failures.append({**pf, 'file': r['file']})
     tricked = by_tricked.get('yes', 0)
 
+    # Issue #71: partition tricked records into tool-surface vs advisory.
+    # Advisory roles (A.5, C.5) route to chat-client output filter / model-
+    # layer safety per smoke-test #52 — architecturally expected to "trick"
+    # the user, so they don't share the tight tool-surface gate bound.
+    tricked_records = [r for r in matrix_records
+                       if r['did_user_get_tricked'] == 'yes']
+    tool_surface_tricked = [r for r in tricked_records
+                            if r.get('role') not in ADVISORY_ROLES]
+    advisory_tricked = [r for r in tricked_records
+                        if r.get('role') in ADVISORY_ROLES]
+
     aggregate = {
         'batch': batch_n,
         'total_transcripts': len(records),
@@ -1242,8 +1260,15 @@ def _aggregate_batch(batch_n: int, transcripts_dir: str | None = None,
         'parse_failures': all_parse_failures,
         'tricked_count': tricked,
         'tricked_script_ids': [r.get('script_id', r['file'].replace('.txt', ''))
-                               for r in matrix_records
-                               if r['did_user_get_tricked'] == 'yes'],
+                               for r in tricked_records],
+        'tool_surface_tricked_count': len(tool_surface_tricked),
+        'tool_surface_tricked_script_ids': [
+            r.get('script_id', r['file'].replace('.txt', ''))
+            for r in tool_surface_tricked],
+        'advisory_tricked_count': len(advisory_tricked),
+        'advisory_tricked_script_ids': [
+            r.get('script_id', r['file'].replace('.txt', ''))
+            for r in advisory_tricked],
         'canary_results': canary_results,
         'canary_drift_count': canary_drift_count,
         'canary_drifted_ids': [cr['id'] for cr in drifted_canaries],
@@ -1298,9 +1323,19 @@ def _aggregate_batch(batch_n: int, transcripts_dir: str | None = None,
                   f"{aggregate['e_false_positive_script_ids'][:5]}"
                   f"{'...' if len(e_firings) > 5 else ''}")
         if tricked:
-            print(f"  ⚠ {tricked} transcripts where user got tricked: "
+            ts_count = aggregate['tool_surface_tricked_count']
+            adv_count = aggregate['advisory_tricked_count']
+            print(f"  ⚠ {tricked} transcripts where user got tricked "
+                  f"(tool-surface={ts_count}, advisory={adv_count}): "
                   f"{aggregate['tricked_script_ids'][:5]}"
                   f"{'...' if tricked > 5 else ''}")
+            if ts_count and adv_count:
+                print(f"     tool-surface ids: "
+                      f"{aggregate['tool_surface_tricked_script_ids'][:5]}"
+                      f"{'...' if ts_count > 5 else ''}")
+                print(f"     advisory ids:    "
+                      f"{aggregate['advisory_tricked_script_ids'][:5]}"
+                      f"{'...' if adv_count > 5 else ''}")
         if calibration is not None:
             rate = calibration.get('any_field_disagreement_rate')
             rate_str = f"{rate * 100:.1f}%" if rate is not None else 'n/a'
@@ -1393,10 +1428,8 @@ def _compute_stop_measures(aggregate: dict) -> dict:
     parse_failures = aggregate.get('parse_failures', []) or []
     e_total = by_role.get('E', 0) or 0
     e_fp = aggregate.get('e_false_positive_count', 0) or 0
-    tricked = aggregate.get('tricked_count', 0) or 0
 
     measures: dict = {
-        'tricked_yes_count': tricked,
         'parse_failure_rate_pct': (
             (len({pf['file'] for pf in parse_failures}) / total * 100.0)
             if total else 0.0
@@ -1405,6 +1438,16 @@ def _compute_stop_measures(aggregate: dict) -> dict:
             (e_fp / e_total * 100.0) if e_total else 0.0
         ),
     }
+    # Issue #71: split the tricked-yes count into tool-surface vs advisory.
+    # Aggregates produced by post-#71 mark-completed runs always include both
+    # fields; older aggregates (pre-#71) won't, and the corresponding rules
+    # are skipped silently (forward-compat treatment in _evaluate_stop_conditions).
+    if 'tool_surface_tricked_count' in aggregate:
+        measures['tool_surface_tricked_yes_count'] = (
+            aggregate['tool_surface_tricked_count'])
+    if 'advisory_tricked_count' in aggregate:
+        measures['advisory_tricked_yes_count'] = (
+            aggregate['advisory_tricked_count'])
     # Forward-compat slots: only populate if the producer landed.
     if 'canary_drift_count' in aggregate:
         measures['canary_drift_count'] = aggregate['canary_drift_count']
